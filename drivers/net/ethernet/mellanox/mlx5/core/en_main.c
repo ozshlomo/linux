@@ -3472,7 +3472,7 @@ static int mlx5e_setup_tc_cls_flower(struct mlx5e_priv *priv,
 static int mlx5e_setup_tc_block_cb(enum tc_setup_type type, void *type_data,
 				   void *cb_priv)
 {
-	unsigned long flags = MLX5_TC_FLAG(INGRESS) | MLX5_TC_FLAG(NIC_OFFLOAD);
+	unsigned long flags = MLX5_TC_FLAG(INGRESS) | MLX5_TC_FLAG(NIC);
 	struct mlx5e_priv *priv = cb_priv;
 
 	switch (type) {
@@ -3670,7 +3670,7 @@ static int set_feature_tc_num_filters(struct net_device *netdev, bool enable)
 {
 	struct mlx5e_priv *priv = netdev_priv(netdev);
 
-	if (!enable && mlx5e_tc_num_filters(priv, MLX5_TC_FLAG(NIC_OFFLOAD))) {
+	if (!enable && mlx5e_tc_num_filters(priv, MLX5_TC_FLAG(NIC))) {
 		netdev_err(netdev,
 			   "Active offloaded tc filters, can't turn hw_tc_offload off\n");
 		return -EINVAL;

@@ -708,7 +708,7 @@ mlx5e_rep_indr_offload(struct net_device *netdev,
 		       struct flow_cls_offload *flower,
 		       struct mlx5e_rep_indr_block_priv *indr_priv)
 {
-	unsigned long flags = MLX5_TC_FLAG(EGRESS) | MLX5_TC_FLAG(ESW_OFFLOAD);
+	unsigned long flags = MLX5_TC_BIT(EGRESS) | MLX5_TC_BIT(ESWITCH);
 	struct mlx5e_priv *priv = netdev_priv(indr_priv->rpriv->netdev);
 	int err = 0;
 
@@ -1226,7 +1226,7 @@ int mlx5e_rep_setup_tc_cls_matchall(struct mlx5e_priv *priv,
 static int mlx5e_rep_setup_tc_cb(enum tc_setup_type type, void *type_data,
 				 void *cb_priv)
 {
-	unsigned long flags = MLX5_TC_FLAG(INGRESS) | MLX5_TC_FLAG(ESW_OFFLOAD);
+	unsigned long flags = MLX5_TC_BIT(INGRESS) | MLX5_TC_BIT(ESWITCH);
 	struct mlx5e_priv *priv = cb_priv;
 
 	switch (type) {
