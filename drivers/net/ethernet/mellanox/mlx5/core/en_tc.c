@@ -2599,6 +2599,8 @@ static struct match_mapping_params match_mappings_arr[] = {
 					 misc_parameters_2.metadata_reg_c_5),
 	},
 	[mp_statezone] = mp_statezone_mapping,
+	[mp_mark] = mp_mark_mapping,
+	[mp_labels] = mp_labels_mapping,
 };
 
 struct match_mapping_params *match_mappings = match_mappings_arr;

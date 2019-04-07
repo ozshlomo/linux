@@ -300,6 +300,8 @@ enum match_mapping_type {
 	mp_tunnel_miss,
 	mp_tupleid = mp_tunnel_miss,
 	mp_statezone,
+	mp_mark,
+	mp_labels,
 };
 
 struct match_mapping_params {
