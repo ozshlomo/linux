@@ -89,6 +89,27 @@ void mlx5e_tc_update_neigh_used_value(struct mlx5e_neigh_hash_entry *nhe);
 int mlx5e_tc_num_filters(struct mlx5e_priv *priv, unsigned long flags);
 
 void mlx5e_tc_reoffload_flows_work(struct work_struct *work);
+struct mlx5e_tc_flow *mlx5e_tc_get_flow(struct mlx5e_priv *priv,
+					int flags,
+					unsigned long cookie);
+extern int __rcu (*tc_skb_update_hook)(struct sk_buff *skb, u32 reg_c0);
+
+enum match_mapping_type {
+	mp_chain,
+	mp_tunnel,
+};
+
+struct match_mapping_params {
+	/* rewrite field */
+	int mfield;
+	int moffset; /*offset of mfield, and soffset */
+	int mlen; /* bytes to rewrite/match */
+
+	/* spec to write, size of mlen above */
+	int soffset;
+};
+
+extern struct match_mapping_params *match_mappings;
 
 bool mlx5e_is_valid_eswitch_fwd_dev(struct mlx5e_priv *priv,
 				    struct net_device *out_dev);
@@ -101,6 +122,8 @@ static inline int  mlx5e_tc_num_filters(struct mlx5e_priv *priv,
 {
 	return 0;
 }
+static inline int  mlx5e_tc_num_filters(struct mlx5e_priv *priv, int flags) { return 0; }
+static int __rcu (*tc_skb_update_hook)(struct sk_buff *skb, u32 reg_c0) = NULL;
 #endif
 
 #endif /* __MLX5_EN_TC_H__ */

@@ -40,6 +40,7 @@
 #include "eswitch.h"
 #include "rdma.h"
 #include "en.h"
+#include "en_tc.h"
 #include "fs_core.h"
 #include "lib/devcom.h"
 #include "lib/eq.h"
@@ -49,6 +50,8 @@
  */
 #define MLX5_ESW_MISS_FLOWS (2)
 
+#define dwork_entries(esw) (esw)->fdb_table.offloads.dwork_entries
+#define fdb_chains_idr(esw) ((esw)->fdb_table.offloads.fdb_chains_idr)
 #define fdb_chains_lock(esw) ((esw)->fdb_table.offloads.fdb_chains_lock)
 #define fdb_chains_ht(esw) ((esw)->fdb_table.offloads.fdb_chains_ht)
 #define fdb_prios_ht(esw) ((esw)->fdb_table.offloads.fdb_prios_ht)
@@ -57,16 +60,23 @@
 	(MLX5_CAP_ESW_FLOWTABLE_FDB((esw)->dev, ignore_flow_level))
 
 #define UPLINK_REP_INDEX 0
+#define MAX_CHAIN_TAG 0xFFFF
 
 struct fdb_chain {
 	struct rhash_head node;
+	struct list_head dwork_entry;
+	struct delayed_work dwork;
+	struct rcu_head rcu;
 
 	u32 chain;
+	u32 id;
 
 	int ref;
 
 	struct mlx5_eswitch *esw;
 	struct list_head prios_list;
+	struct mlx5_flow_handle *restore_rule;
+	int miss_hdr_id;
 };
 
 struct fdb_prio {
@@ -114,6 +124,8 @@ static struct mlx5_flow_table *
 esw_get_prio_table(struct mlx5_eswitch *esw, u32 chain, u32 prio, u32 level);
 static void
 esw_put_prio_table(struct mlx5_eswitch *esw, u32 chain, u32 prio, u32 level);
+static void
+flush_prio_table_work(struct mlx5_eswitch *esw);
 
 bool mlx5_eswitch_prios_supported(struct mlx5_eswitch *esw)
 {
@@ -1030,6 +1042,80 @@ put_fdb_table(struct mlx5_eswitch *esw, struct mlx5_flow_table *fdb)
 	mlx5_destroy_flow_table(fdb);
 }
 
+static struct mlx5_flow_handle *esw_add_restore_rule(struct mlx5_eswitch *esw,
+						     int tag)
+{
+	struct mlx5_flow_act flow_act = { .flags = FLOW_ACT_NO_APPEND, };
+	struct mlx5_flow_table *ft = esw->offloads.ft_offloads_restore;
+	struct mlx5_flow_context *flow_context;
+	struct mlx5_flow_spec s, *spec = &s;
+	struct mlx5_flow_handle *flow_rule;
+	struct mlx5_flow_destination dest;
+	void *misc;
+
+	memset(spec, 0, sizeof(*spec));
+	misc = MLX5_ADDR_OF(fte_match_param, spec->match_criteria, misc_parameters_2);
+	MLX5_SET(fte_match_set_misc2, misc, metadata_reg_c_0, MAX_CHAIN_TAG);
+	misc = MLX5_ADDR_OF(fte_match_param, spec->match_value, misc_parameters_2);
+	MLX5_SET(fte_match_set_misc2, misc, metadata_reg_c_0, tag);
+	spec->match_criteria_enable = MLX5_MATCH_MISC_PARAMETERS_2;
+	flow_act.action = MLX5_FLOW_CONTEXT_ACTION_FWD_DEST;
+
+	flow_context = &spec->flow_context;
+	flow_context->flags |= FLOW_CONTEXT_HAS_TAG;
+	flow_context->flow_tag = tag;
+	dest.type = MLX5_FLOW_DESTINATION_TYPE_FLOW_TABLE;
+	dest.ft = esw->offloads.ft_offloads;
+	flow_rule = mlx5_add_flow_rules(ft, spec, &flow_act, &dest, 1);
+
+	if (IS_ERR(flow_rule))
+		esw_warn(esw->dev, "Failed to create restore rule for tag: %d, err(%d)\n", tag, (int) PTR_ERR(flow_rule));
+
+	return flow_rule;
+}
+
+static int create_fdb_chain_restore(struct fdb_chain *fdb_chain)
+{
+	char modact[MLX5_UN_SZ_BYTES(set_action_in_add_action_in_auto)];
+	struct mlx5_eswitch *esw = fdb_chain->esw;
+	u32 index = 1;
+	int err;
+
+	if (!fdb_chain->chain)
+		return 0;
+
+	err = idr_alloc_u32(&fdb_chains_idr(esw), fdb_chain, &index,
+			    MAX_CHAIN_TAG, GFP_KERNEL);
+	if (err)
+		return err;
+	fdb_chain->id = index;
+
+	MLX5_SET(set_action_in, modact, action_type, MLX5_ACTION_TYPE_SET);
+	MLX5_SET(set_action_in, modact, field, match_mappings[mp_chain].mfield);
+	MLX5_SET(set_action_in, modact, offset, match_mappings[mp_chain].moffset*8);
+	MLX5_SET(set_action_in, modact, length, match_mappings[mp_chain].mlen*8);
+	MLX5_SET(set_action_in, modact, data, fdb_chain->id);
+	err = mlx5_modify_header_alloc(esw->dev, MLX5_FLOW_NAMESPACE_FDB,
+				       1, modact, &fdb_chain->miss_hdr_id);
+	if (err)
+		goto err_mod_hdr;
+
+	fdb_chain->restore_rule = esw_add_restore_rule(esw, fdb_chain->id);
+	if (IS_ERR(fdb_chain->restore_rule)) {
+		err = PTR_ERR(fdb_chain->restore_rule);
+		goto err_rule;
+	}
+
+	return 0;
+
+err_rule:
+	mlx5_modify_header_dealloc(esw->dev, fdb_chain->miss_hdr_id);
+err_mod_hdr:
+	/* Datapath can't find this mapping, so we can safely remove it */
+	idr_remove(&fdb_chains_idr(esw), fdb_chain->id);
+	return err;
+}
+
 static struct fdb_chain *create_fdb_chain(struct mlx5_eswitch *esw, u32 chain)
 {
 	struct fdb_chain *fdb_chain = NULL;
@@ -1040,6 +1126,7 @@ static struct fdb_chain *create_fdb_chain(struct mlx5_eswitch *esw, u32 chain)
 		return ERR_PTR(-ENOMEM);
 
 	fdb_chain->chain = chain;
+	fdb_chain->esw = esw;
 	INIT_LIST_HEAD(&fdb_chain->prios_list);
 
 	err = rhashtable_insert_fast(&fdb_chains_ht(esw), &fdb_chain->node,
@@ -1047,19 +1134,61 @@ static struct fdb_chain *create_fdb_chain(struct mlx5_eswitch *esw, u32 chain)
 	if (err)
 		goto err_insert;
 
+	err = create_fdb_chain_restore(fdb_chain);
+	if (err)
+		goto err_restore;
+
 	return fdb_chain;
 
+err_restore:
+	rhashtable_remove_fast(&fdb_chains_ht(esw), &fdb_chain->node,
+			       chain_params);
 err_insert:
 	kvfree(fdb_chain);
 	return ERR_PTR(err);
 }
 
+static void destroy_fdb_chain_work(struct work_struct *work)
+{
+	struct fdb_chain *fdb_chain = container_of(work, struct fdb_chain,
+						   dwork.work);
+
+	mutex_lock(&fdb_chains_lock(fdb_chain->esw));
+	list_del(&fdb_chain->dwork_entry);
+	/* idr_remove() is safe against idr_find() */
+	idr_remove(&fdb_chains_idr(fdb_chain->esw), fdb_chain->id);
+	mutex_unlock(&fdb_chains_lock(fdb_chain->esw));
+
+	kfree_rcu(fdb_chain, rcu);
+}
+
+/* We wait some time to release the mapping, since a quick delete and add
+ * might get the same id from idr, while a packet marked with the old
+ * mapping arrives from hardware and can use the old mapping.
+ */
+#define FDB_CHAIN_DESTROY_GRACE_PERIOD 2000
 static void destroy_fdb_chain(struct fdb_chain *fdb_chain)
 {
+	unsigned long dt = msecs_to_jiffies(FDB_CHAIN_DESTROY_GRACE_PERIOD);
 	struct mlx5_eswitch *esw = fdb_chain->esw;
 
 	rhashtable_remove_fast(&fdb_chains_ht(esw), &fdb_chain->node,
 			       chain_params);
+	if (fdb_chain->chain) {
+		mlx5_del_flow_rules(fdb_chain->restore_rule);
+		mlx5_modify_header_dealloc(esw->dev, fdb_chain->miss_hdr_id);
+
+		INIT_DELAYED_WORK(&fdb_chain->dwork, destroy_fdb_chain_work);
+		if (queue_delayed_work(esw->work_queue, &fdb_chain->dwork, dt)) {
+			/* No race with destroy_fdb_chain_work, probably */
+			list_add(&fdb_chain->dwork_entry, &dwork_entries(esw));
+			return;
+		}
+
+		WARN_ON(true);
+		return;
+	}
+
 	kvfree(fdb_chain);
 }
 
@@ -1090,6 +1219,7 @@ static struct mlx5_flow_handle *
 fdb_prio_add_miss_rule(struct fdb_prio *fdb_prio,
 		       struct mlx5_flow_table *next_fdb)
 {
+	struct fdb_chain *fdb_chain = fdb_prio->fdb_chain;
 	struct mlx5_flow_destination dest = {};
 	struct mlx5_flow_spec spec = {};
 	struct mlx5_flow_act act = {};
@@ -1099,6 +1229,18 @@ fdb_prio_add_miss_rule(struct fdb_prio *fdb_prio,
 	act.flags = FLOW_ACT_NO_APPEND;
 	dest.type = MLX5_FLOW_DESTINATION_TYPE_FLOW_TABLE;
 	dest.ft = next_fdb;
+
+	if (fdb_prio->chain != 0 && next_fdb == slow_fdb(fdb_chain->esw)) {
+		/* If we are last in chain, use chain miss hdr to mark
+		 * the packet.
+		 * We mark packets on miss and not on the fwd action
+		 * but every dest_chain rule (goto action) action will create
+		 * next's chain prio 1, so at least one prio exists in next
+		 * chain to mark the packet after the fwd action.
+		 */
+		act.modify_id = fdb_chain->miss_hdr_id;
+		act.action |= MLX5_FLOW_CONTEXT_ACTION_MOD_HDR;
+	}
 
 	return mlx5_add_flow_rules(fdb_prio->fdb, &spec, &act, &dest, 1);
 }
@@ -1347,6 +1489,26 @@ err_get_prio:
 	WARN_ON(1);
 }
 
+static void flush_prio_table_work(struct mlx5_eswitch *esw)
+{
+	struct fdb_chain *fdb_chain;
+	struct list_head *pos, *tmp;
+
+	mutex_lock(&fdb_chains_lock(esw));
+	list_for_each_safe(pos, tmp, &dwork_entries(esw)) {
+		fdb_chain = list_entry(pos, struct fdb_chain, dwork_entry);
+
+		if (!cancel_delayed_work(&fdb_chain->dwork))
+			continue;
+
+		destroy_fdb_chain_work(&fdb_chain->dwork.work);
+	}
+	mutex_unlock(&fdb_chains_lock(esw));
+
+	/* Wait for work that wasn't canceled */
+	flush_workqueue(esw->work_queue);
+}
+
 #define MAX_PF_SQ 256
 #define MAX_SQ_NVPORTS 32
 
@@ -1391,6 +1553,8 @@ static int esw_create_offloads_fdb_tables(struct mlx5_eswitch *esw, int nvports)
 	esw_debug(esw->dev, "Create offloads FDB Tables\n");
 
 	mutex_init(&fdb_chains_lock(esw));
+	idr_init(&fdb_chains_idr(esw));
+	INIT_LIST_HEAD(&dwork_entries(esw));
 
 	err = rhashtable_init(&fdb_chains_ht(esw), &chain_params);
 	if (err)
@@ -1398,7 +1562,7 @@ static int esw_create_offloads_fdb_tables(struct mlx5_eswitch *esw, int nvports)
 
 	err = rhashtable_init(&fdb_prios_ht(esw), &prio_params);
 	if (err)
-		goto init_err;
+		goto init_prio_err;
 
 	flow_group_in = kvzalloc(inlen, GFP_KERNEL);
 	if (!flow_group_in)
@@ -1572,6 +1736,7 @@ send_vport_err:
 		esw_put_prio_table(esw, 0, 1, 1);
 level_fdb_err:
 	esw_put_prio_table(esw, 0, 1, 0);
+	flush_prio_table_work(esw);
 fast_fdb_err:
 	mlx5_destroy_flow_table(esw->fdb_table.offloads.slow_fdb);
 slow_fdb_err:
@@ -1579,8 +1744,9 @@ ns_err:
 	kvfree(flow_group_in);
 alloc_err:
 	rhashtable_destroy(&fdb_prios_ht(esw));
-init_err:
+init_prio_err:
 	rhashtable_destroy(&fdb_chains_ht(esw));
+	idr_destroy(&fdb_chains_idr(esw));
 	mutex_destroy(&fdb_chains_lock(esw));
 	return err;
 }
@@ -1600,10 +1766,14 @@ static void esw_destroy_offloads_fdb_tables(struct mlx5_eswitch *esw)
 	if (!mlx5_eswitch_prios_supported(esw))
 		esw_put_prio_table(esw, 0, 1, 1);
 	esw_put_prio_table(esw, 0, 1, 0);
+	flush_prio_table_work(esw);
+
 	mlx5_destroy_flow_table(esw->fdb_table.offloads.slow_fdb);
 
 	rhashtable_destroy(&fdb_prios_ht(esw));
 	rhashtable_destroy(&fdb_chains_ht(esw));
+
+	idr_destroy(&fdb_chains_idr(esw));
 	mutex_destroy(&fdb_chains_lock(esw));
 }
 
@@ -1622,6 +1792,7 @@ static int esw_create_offloads_table(struct mlx5_eswitch *esw, int nvports)
 	}
 
 	ft_attr.max_fte = nvports + MLX5_ESW_MISS_FLOWS;
+	ft_attr.prio = 1;
 
 	ft_offloads = mlx5_create_flow_table(ns, &ft_attr);
 	if (IS_ERR(ft_offloads)) {
@@ -1723,6 +1894,75 @@ mlx5_eswitch_create_vport_rx_rule(struct mlx5_eswitch *esw, u16 vport,
 out:
 	kvfree(spec);
 	return flow_rule;
+}
+
+static void esw_destroy_restore_table(struct mlx5_eswitch *esw)
+{
+	struct mlx5_esw_offload *offloads = &esw->offloads;
+
+	mlx5_destroy_flow_group(offloads->restore_group);
+	mlx5_destroy_flow_table(offloads->ft_offloads_restore);
+}
+
+static int esw_create_restore_table(struct mlx5_eswitch *esw)
+{
+	int inlen = MLX5_ST_SZ_BYTES(create_flow_group_in);
+	struct mlx5_flow_table_attr ft_attr = {};
+	struct mlx5_core_dev *dev = esw->dev;
+	struct mlx5_flow_namespace *ns;
+	void *match_criteria, *misc;
+	struct mlx5_flow_table *ft;
+	struct mlx5_flow_group *g;
+	u32 *flow_group_in;
+	int err = 0;
+
+	ns = mlx5_get_flow_namespace(dev, MLX5_FLOW_NAMESPACE_OFFLOADS);
+	if (!ns) {
+		esw_warn(esw->dev, "Failed to get offloads flow namespace\n");
+		return -EOPNOTSUPP;
+	}
+
+	flow_group_in = kvzalloc(inlen, GFP_KERNEL);
+	if (!flow_group_in) {
+		err = -ENOMEM;
+		goto out_free;
+	}
+
+	ft_attr.max_fte = MAX_CHAIN_TAG;
+	ft = mlx5_create_flow_table(ns, &ft_attr);
+	if (IS_ERR(ft)) {
+		err = PTR_ERR(ft);
+		esw_warn(esw->dev, "Failed to create restore table, err %d\n", err);
+		goto out_free;
+	}
+
+	memset(flow_group_in, 0, inlen);
+	MLX5_SET(create_flow_group_in, flow_group_in, match_criteria_enable,
+		 MLX5_MATCH_MISC_PARAMETERS_2);
+
+	match_criteria = MLX5_ADDR_OF(create_flow_group_in, flow_group_in, match_criteria);
+	misc = MLX5_ADDR_OF(fte_match_param, match_criteria, misc_parameters_2);
+	MLX5_SET(fte_match_set_misc2, misc, metadata_reg_c_0, MAX_CHAIN_TAG);
+	MLX5_SET(create_flow_group_in, flow_group_in, start_flow_index, 0);
+	MLX5_SET(create_flow_group_in, flow_group_in, end_flow_index, ft_attr.max_fte - 1);
+	g = mlx5_create_flow_group(ft, flow_group_in);
+	if (IS_ERR(g)) {
+		err = PTR_ERR(g);
+		esw_warn(dev, "Failed to create restore flow group err(%d)\n", err);
+		goto err_group;
+	}
+
+	esw->offloads.ft_offloads_restore = ft;
+	esw->offloads.restore_group = g;
+
+	return 0;
+
+err_group:
+	mlx5_destroy_flow_table(ft);
+out_free:
+	kvfree(flow_group_in);
+
+	return err;
 }
 
 static int esw_offloads_start(struct mlx5_eswitch *esw,
@@ -2380,13 +2620,17 @@ static int esw_offloads_steering_init(struct mlx5_eswitch *esw)
 	if (err)
 		return err;
 
+	err = esw_create_offloads_table(esw, total_vports);
+	if (err)
+		goto create_offloads_err;
+
+	err = esw_create_restore_table(esw);
+	if (err)
+		goto create_restore_err;
+
 	err = esw_create_offloads_fdb_tables(esw, total_vports);
 	if (err)
 		goto create_fdb_err;
-
-	err = esw_create_offloads_table(esw, total_vports);
-	if (err)
-		goto create_ft_err;
 
 	err = esw_create_vport_rx_group(esw, total_vports);
 	if (err)
@@ -2395,12 +2639,12 @@ static int esw_offloads_steering_init(struct mlx5_eswitch *esw)
 	return 0;
 
 create_fg_err:
-	esw_destroy_offloads_table(esw);
-
-create_ft_err:
 	esw_destroy_offloads_fdb_tables(esw);
-
 create_fdb_err:
+	esw_destroy_restore_table(esw);
+create_restore_err:
+	esw_destroy_offloads_table(esw);
+create_offloads_err:
 	esw_destroy_offloads_acl_tables(esw);
 
 	return err;
@@ -2409,8 +2653,9 @@ create_fdb_err:
 static void esw_offloads_steering_cleanup(struct mlx5_eswitch *esw)
 {
 	esw_destroy_vport_rx_group(esw);
-	esw_destroy_offloads_table(esw);
 	esw_destroy_offloads_fdb_tables(esw);
+	esw_destroy_restore_table(esw);
+	esw_destroy_offloads_table(esw);
 	esw_destroy_offloads_acl_tables(esw);
 }
 
@@ -2936,3 +3181,18 @@ u32 mlx5_eswitch_get_vport_metadata_for_match(const struct mlx5_eswitch *esw,
 	return ((MLX5_CAP_GEN(esw->dev, vhca_id) & 0xff) | vport_num) << 16;
 }
 EXPORT_SYMBOL(mlx5_eswitch_get_vport_metadata_for_match);
+
+u32 mlx5_eswitch_get_chain_for_tag(struct mlx5_eswitch *esw, u32 tag)
+{
+	struct fdb_chain *fdb_chain;
+	u32 ret;
+
+	fdb_chain = idr_find(&fdb_chains_idr(esw), tag & MAX_CHAIN_TAG);
+	ret = fdb_chain ? fdb_chain->chain : 0;
+
+	if (!ret)
+		esw_warn(esw->dev, "%s can't find chain for tag: %d\n", __func__,
+			 tag & MAX_CHAIN_TAG);
+
+	return ret;
+}

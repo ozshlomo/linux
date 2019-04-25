@@ -151,6 +151,8 @@ struct mlx5e_tc_flow_parse_attr {
 #define MLX5E_TC_TABLE_NUM_GROUPS 4
 #define MLX5E_TC_TABLE_MAX_GROUP_SIZE BIT(16)
 
+int __rcu (*tc_skb_update_hook)(struct sk_buff *skb, u32 reg_c0);
+
 struct mlx5e_hairpin {
 	struct mlx5_hairpin *pair;
 
@@ -2682,6 +2684,18 @@ out_ok:
 	return true;
 }
 
+static struct match_mapping_params match_mappings_arr[] = {
+	[mp_chain] = {
+		.mfield = MLX5_ACTION_IN_FIELD_METADATA_REG_C_0,
+		.moffset = 0,
+		.mlen = 2,
+		.soffset = MLX5_BYTE_OFF(fte_match_param,
+					 misc_parameters_2.metadata_reg_c_0),
+	},
+};
+
+struct match_mapping_params *match_mappings = match_mappings_arr;
+
 static bool actions_match_supported(struct mlx5e_priv *priv,
 				    struct flow_action *flow_action,
 				    struct mlx5e_tc_flow_parse_attr *parse_attr,
@@ -4109,13 +4123,23 @@ void mlx5e_tc_nic_cleanup(struct mlx5e_priv *priv)
 	mutex_destroy(&tc->t_lock);
 }
 
+static int mlx5e_update_skb(struct sk_buff *skb, u32 reg_c0);
 int mlx5e_tc_esw_init(struct rhashtable *tc_ht)
 {
-	return rhashtable_init(tc_ht, &tc_ht_params);
+	int err;
+
+	err = rhashtable_init(tc_ht, &tc_ht_params);
+	if (!err)
+		rcu_assign_pointer(tc_skb_update_hook, mlx5e_update_skb);
+
+	return err;
 }
 
 void mlx5e_tc_esw_cleanup(struct rhashtable *tc_ht)
 {
+	RCU_INIT_POINTER(tc_skb_update_hook, NULL);
+	synchronize_rcu();
+
 	rhashtable_free_and_destroy(tc_ht, _mlx5e_tc_del_flow, NULL);
 }
 
@@ -4147,4 +4171,39 @@ void mlx5e_tc_reoffload_flows_work(struct work_struct *work)
 			unready_flow_del(flow);
 	}
 	mutex_unlock(&rpriv->unready_flows_lock);
+}
+
+static int mlx5e_update_skb(struct sk_buff *skb, u32 reg_c0)
+{
+	struct mlx5_rep_uplink_priv *uplink_priv;
+	struct mlx5e_rep_priv *uplink_rpriv;
+	struct tc_skb_ext *chainp;
+	struct mlx5_eswitch *esw;
+	struct mlx5e_priv *priv;
+	u32 chain = 0;
+
+	if (!mlx5e_eswitch_rep(skb->dev))
+		return 0;
+
+	priv = netdev_priv(skb->dev);
+	esw = priv->mdev->priv.eswitch;
+	uplink_rpriv = mlx5_eswitch_get_uplink_priv(esw, REP_ETH);
+	uplink_priv = &uplink_rpriv->uplink_priv;
+
+	if (!reg_c0)
+		return 0;
+
+	chain = mlx5_eswitch_get_chain_for_tag(esw, reg_c0);
+	if (WARN_ON_ONCE(chain == 0))
+		return 0;
+
+	chainp = skb_ext_add(skb, TC_SKB_EXT);
+	if (!chainp) {
+		WARN_ON(1);
+		return 0;
+	}
+
+	chainp->chain = chain;
+
+	return 0;
 }

@@ -162,8 +162,11 @@ struct mlx5_eswitch_fdb {
 			struct mlx5_flow_handle *miss_rule_multi;
 			int vlan_push_pop_refcount;
 
+			struct list_head dwork_entries;
 			struct rhashtable fdb_chains_ht;
 			struct rhashtable fdb_prios_ht;
+			struct idr fdb_chains_idr;
+			struct idr __rcu *fdb_chains_fast_idr;
 			/* Protects fdb_chains */
 			struct mutex fdb_chains_lock;
 
@@ -174,6 +177,11 @@ struct mlx5_eswitch_fdb {
 };
 
 struct mlx5_esw_offload {
+	struct mlx5_flow_table *ft_offloads_restore;
+	struct mlx5_flow_group *restore_group;
+	struct mlx5_flow_handle **restore_rules;
+	int restore_copy_hdr_id;
+
 	struct mlx5_flow_table *ft_offloads;
 	struct mlx5_flow_group *vport_rx_group;
 	struct mlx5_eswitch_rep *vport_reps;
@@ -595,6 +603,7 @@ void
 mlx5_eswitch_enable_pf_vf_vports(struct mlx5_eswitch *esw,
 				 enum mlx5_eswitch_vport_event enabled_events);
 void mlx5_eswitch_disable_pf_vf_vports(struct mlx5_eswitch *esw);
+u32 mlx5_eswitch_get_chain_for_tag(struct mlx5_eswitch *esw, u32 tag);
 
 #else  /* CONFIG_MLX5_ESWITCH */
 /* eswitch API stubs */
