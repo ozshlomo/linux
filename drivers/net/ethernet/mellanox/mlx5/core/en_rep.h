@@ -83,6 +83,7 @@ struct mlx5_rep_uplink_priv {
 
 	struct idr tunnel_ids;
 	struct list_head tunnel_pending_work;
+	void *ct_control;
 };
 
 struct mlx5e_rep_priv {
