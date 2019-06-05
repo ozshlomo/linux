@@ -66,6 +66,7 @@ struct mlx5_fc {
 
 	bool virtual;
 	struct mlx5_fc *parent;
+	struct mlx5_fc_cb *cb;
 	struct mlx5_fc_cache cache ____cacheline_aligned_in_smp;
 };
 
@@ -167,17 +168,24 @@ static void update_counter_cache(struct mlx5_fc *counter, int index,
 	if (cache->packets == packets)
 		return;
 
+	/* To do, recurse here */
 	if (counter->parent) {
 		struct mlx5_fc_cache *cp = &counter->parent->cache;
 
 		cp->packets += (packets - cache->packets);
 		cp->bytes += (bytes - cache->bytes);
 		cp->lastuse = jiffies;
+
+		if (counter->parent->cb)
+			counter->parent->cb->updated(counter->parent->cb, cp->packets, cp->bytes);
 	}
 
 	cache->packets = packets;
 	cache->bytes = bytes;
 	cache->lastuse = jiffies;
+
+	if (counter->cb)
+		counter->cb->updated(counter->cb, packets, bytes);
 }
 
 static void mlx5_fc_stats_query_counter_range(struct mlx5_core_dev *dev,
@@ -477,6 +485,12 @@ u64 mlx5_fc_query_lastuse(struct mlx5_fc *counter)
 {
 	return counter->cache.lastuse;
 }
+
+void mlx5_fc_register_set_cb(struct mlx5_fc *counter, struct mlx5_fc_cb *cb)
+{
+	counter->cb = cb;
+}
+EXPORT_SYMBOL(mlx5_fc_register_set_cb);
 
 void mlx5_fc_query_cached(struct mlx5_fc *counter,
 			  u64 *bytes, u64 *packets, u64 *lastuse)
