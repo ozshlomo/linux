@@ -6105,6 +6105,7 @@ static void mlx5_ib_stage_init_cleanup(struct mlx5_ib_dev *dev)
 		cleanup_srcu_struct(&dev->mr_srcu);
 	}
 
+	WARN_ON(!xa_empty(&dev->mkey_table));
 	WARN_ON(!bitmap_empty(dev->dm.memic_alloc_pages, MLX5_MAX_MEMIC_PAGES));
 
 	WARN_ON(dev->dm.steering_sw_icm_alloc_blocks &&
@@ -6202,6 +6203,8 @@ static int mlx5_ib_stage_init_init(struct mlx5_ib_dev *dev)
 				goto err_dm;
 		}
 	}
+
+	xa_init_flags(&dev->mkey_table, XA_FLAGS_LOCK_IRQ);
 
 	spin_lock_init(&dev->dm.lock);
 	dev->dm.dev = mdev;
