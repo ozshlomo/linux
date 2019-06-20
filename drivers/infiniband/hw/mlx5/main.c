@@ -6204,6 +6204,7 @@ static int mlx5_ib_stage_init_init(struct mlx5_ib_dev *dev)
 		}
 	}
 
+	spin_lock_init(&dev->mkey_lock);
 	xa_init_flags(&dev->mkey_table, XA_FLAGS_LOCK_IRQ);
 
 	spin_lock_init(&dev->dm.lock);
