@@ -106,7 +106,7 @@ mlx5_eswitch_set_rule_source_port(struct mlx5_eswitch *esw,
 								   attr->in_rep->vport));
 
 		misc2 = MLX5_ADDR_OF(fte_match_param, spec->match_criteria, misc_parameters_2);
-		MLX5_SET_TO_ONES(fte_match_set_misc2, misc2, metadata_reg_c_0);
+		MLX5_SET(fte_match_set_misc2, misc2, metadata_reg_c_0, 0xFFFF0000);
 
 		spec->match_criteria_enable |= MLX5_MATCH_MISC_PARAMETERS_2;
 		misc = MLX5_ADDR_OF(fte_match_param, spec->match_criteria, misc_parameters);
@@ -608,10 +608,13 @@ static int esw_set_passing_vport_metadata(struct mlx5_eswitch *esw, bool enable)
 	fdb_to_vport_reg_c_id = MLX5_GET(query_esw_vport_context_out, out,
 					 esw_vport_context.fdb_to_vport_reg_c_id);
 
-	if (enable)
+	if (enable) {
 		fdb_to_vport_reg_c_id |= MLX5_FDB_TO_VPORT_REG_C_0;
-	else
+		fdb_to_vport_reg_c_id |= MLX5_FDB_TO_VPORT_REG_C_1;
+	} else {
 		fdb_to_vport_reg_c_id &= ~MLX5_FDB_TO_VPORT_REG_C_0;
+		fdb_to_vport_reg_c_id &= ~MLX5_FDB_TO_VPORT_REG_C_1;
+	}
 
 	MLX5_SET(modify_esw_vport_context_in, in,
 		 esw_vport_context.fdb_to_vport_reg_c_id, fdb_to_vport_reg_c_id);
@@ -633,7 +636,7 @@ static void peer_miss_rules_setup(struct mlx5_eswitch *esw,
 	if (mlx5_eswitch_vport_match_metadata_enabled(esw)) {
 		misc = MLX5_ADDR_OF(fte_match_param, spec->match_criteria,
 				    misc_parameters_2);
-		MLX5_SET_TO_ONES(fte_match_set_misc2, misc, metadata_reg_c_0);
+		MLX5_SET(fte_match_set_misc2, misc, metadata_reg_c_0, 0xFFFF0000);
 
 		spec->match_criteria_enable = MLX5_MATCH_MISC_PARAMETERS_2;
 	} else {
@@ -1031,8 +1034,8 @@ static void esw_set_flow_group_source_port(struct mlx5_eswitch *esw,
 			 match_criteria_enable,
 			 MLX5_MATCH_MISC_PARAMETERS_2);
 
-		MLX5_SET_TO_ONES(fte_match_param, match_criteria,
-				 misc_parameters_2.metadata_reg_c_0);
+		MLX5_SET(fte_match_param, match_criteria,
+			 misc_parameters_2.metadata_reg_c_0, 0xFFFF0000);
 	} else {
 		MLX5_SET(create_flow_group_in, flow_group_in,
 			 match_criteria_enable,
@@ -1320,7 +1323,7 @@ mlx5_eswitch_create_vport_rx_rule(struct mlx5_eswitch *esw, u16 vport,
 			 mlx5_eswitch_get_vport_metadata_for_match(esw, vport));
 
 		misc = MLX5_ADDR_OF(fte_match_param, spec->match_criteria, misc_parameters_2);
-		MLX5_SET_TO_ONES(fte_match_set_misc2, misc, metadata_reg_c_0);
+		MLX5_SET(fte_match_set_misc2, misc, metadata_reg_c_0, 0xFFFF0000);
 
 		spec->match_criteria_enable = MLX5_MATCH_MISC_PARAMETERS_2;
 	} else {
@@ -2555,6 +2558,6 @@ EXPORT_SYMBOL(mlx5_eswitch_vport_match_metadata_enabled);
 u32 mlx5_eswitch_get_vport_metadata_for_match(const struct mlx5_eswitch *esw,
 					      u16 vport_num)
 {
-	return ((MLX5_CAP_GEN(esw->dev, vhca_id) & 0xffff) << 16) | vport_num;
+	return ((MLX5_CAP_GEN(esw->dev, vhca_id) & 0xff) | vport_num) << 16;
 }
 EXPORT_SYMBOL(mlx5_eswitch_get_vport_metadata_for_match);
