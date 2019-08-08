@@ -96,7 +96,7 @@ extern int __rcu (*tc_skb_update_hook)(struct sk_buff *skb, u32 reg_c0);
 
 enum match_mapping_type {
 	mp_chain,
-	mp_tunnel,
+	mp_tunnel_match,
 };
 
 struct match_mapping_params {
