@@ -1343,7 +1343,7 @@ static void mini_qdisc_rcu_func(struct rcu_head *head)
 }
 
 void mini_qdisc_pair_swap(struct mini_Qdisc_pair *miniqp,
-			  struct tcf_proto *tp_head)
+			  struct tcf_block *block, struct tcf_proto *tp_head)
 {
 	/* Protected with chain0->filter_chain_lock.
 	 * Can't access chain directly because tp_head can be NULL.
@@ -1368,6 +1368,7 @@ void mini_qdisc_pair_swap(struct mini_Qdisc_pair *miniqp,
 	 */
 	rcu_barrier();
 	miniq->filter_list = tp_head;
+	miniq->block = block;
 	rcu_assign_pointer(*miniqp->p_miniq, miniq);
 
 	if (miniq_old)

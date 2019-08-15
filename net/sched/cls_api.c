@@ -21,6 +21,7 @@
 #include <linux/slab.h>
 #include <linux/idr.h>
 #include <linux/rhashtable.h>
+#include <linux/rculist.h>
 #include <net/net_namespace.h>
 #include <net/sock.h>
 #include <net/netlink.h>
@@ -305,7 +306,7 @@ static struct tcf_chain *tcf_chain_create(struct tcf_block *block,
 	chain = kzalloc(sizeof(*chain), GFP_KERNEL);
 	if (!chain)
 		return NULL;
-	list_add_tail(&chain->list, &block->chain_list);
+	list_add_tail_rcu(&chain->list, &block->chain_list);
 	mutex_init(&chain->filter_chain_lock);
 	chain->block = block;
 	chain->index = chain_index;
@@ -316,10 +317,12 @@ static struct tcf_chain *tcf_chain_create(struct tcf_block *block,
 }
 
 static void tcf_chain_head_change_item(struct tcf_filter_chain_list_item *item,
+				       struct tcf_block *block,
 				       struct tcf_proto *tp_head)
 {
 	if (item->chain_head_change)
-		item->chain_head_change(tp_head, item->chain_head_change_priv);
+		item->chain_head_change(block, tp_head,
+					item->chain_head_change_priv);
 }
 
 static void tcf_chain0_head_change(struct tcf_chain *chain,
@@ -333,7 +336,7 @@ static void tcf_chain0_head_change(struct tcf_chain *chain,
 
 	mutex_lock(&block->lock);
 	list_for_each_entry(item, &block->chain0.filter_chain_list, list)
-		tcf_chain_head_change_item(item, tp_head);
+		tcf_chain_head_change_item(item, block, tp_head);
 	mutex_unlock(&block->lock);
 }
 
@@ -345,7 +348,7 @@ static bool tcf_chain_detach(struct tcf_chain *chain)
 
 	ASSERT_BLOCK_LOCKED(block);
 
-	list_del(&chain->list);
+	list_del_rcu(&chain->list);
 	if (!chain->index)
 		block->chain0.chain = NULL;
 
@@ -397,6 +400,18 @@ static struct tcf_chain *tcf_chain_lookup(struct tcf_block *block,
 	ASSERT_BLOCK_LOCKED(block);
 
 	list_for_each_entry(chain, &block->chain_list, list) {
+		if (chain->index == chain_index)
+			return chain;
+	}
+	return NULL;
+}
+
+static struct tcf_chain *tcf_chain_lookup_rcu(const struct tcf_block *block,
+					      u32 chain_index)
+{
+	struct tcf_chain *chain;
+
+	list_for_each_entry_rcu(chain, &block->chain_list, list) {
 		if (chain->index == chain_index)
 			return chain;
 	}
@@ -739,7 +754,7 @@ tcf_chain0_head_change_cb_add(struct tcf_block *block,
 
 		tp_head = tcf_chain_dereference(chain0->filter_chain, chain0);
 		if (tp_head)
-			tcf_chain_head_change_item(item, tp_head);
+			tcf_chain_head_change_item(item, block, tp_head);
 
 		mutex_lock(&block->lock);
 		list_add(&item->list, &block->chain0.filter_chain_list);
@@ -764,7 +779,7 @@ tcf_chain0_head_change_cb_del(struct tcf_block *block,
 		    (item->chain_head_change == ei->chain_head_change &&
 		     item->chain_head_change_priv == ei->chain_head_change_priv)) {
 			if (block->chain0.chain)
-				tcf_chain_head_change_item(item, NULL);
+				tcf_chain_head_change_item(item, NULL, NULL);
 			list_del(&item->list);
 			mutex_unlock(&block->lock);
 
@@ -1299,7 +1314,8 @@ err_block_insert:
 }
 EXPORT_SYMBOL(tcf_block_get_ext);
 
-static void tcf_chain_head_change_dflt(struct tcf_proto *tp_head, void *priv)
+static void tcf_chain_head_change_dflt(struct tcf_block *block,
+				       struct tcf_proto *tp_head, void *priv)
 {
 	struct tcf_proto __rcu **p_filter_chain = priv;
 
@@ -1463,11 +1479,11 @@ static int tcf_block_setup(struct tcf_block *block,
  * specific classifiers.
  */
 int tcf_classify(struct sk_buff *skb, const struct tcf_proto *tp,
-		 struct tcf_result *res, bool compat_mode)
+		 const struct tcf_proto *orig_tp, struct tcf_result *res,
+		 bool compat_mode)
 {
 #ifdef CONFIG_NET_CLS_ACT
 	const int max_reclassify_loop = 4;
-	const struct tcf_proto *orig_tp = tp;
 	const struct tcf_proto *first_tp;
 	int limit = 0;
 
@@ -1523,6 +1539,34 @@ reset:
 #endif
 }
 EXPORT_SYMBOL(tcf_classify);
+
+int tcf_classify_ingress(struct sk_buff *skb,
+			 const struct tcf_block *ingress_block,
+			 const struct tcf_proto *tp, struct tcf_result *res,
+			 bool compat_mode)
+{
+	const struct tcf_proto *orig_tp = tp;
+
+#ifdef CONFIG_NET_CLS_ACT
+#if IS_ENABLED(CONFIG_NET_TC_SKB_EXT)
+	{
+		struct tc_skb_ext *ext = skb_ext_find(skb, TC_SKB_EXT);
+
+		if (ext && ext->chain && ingress_block) {
+			struct tcf_chain *fchain;
+
+			fchain = tcf_chain_lookup_rcu(ingress_block,
+						      ext->chain);
+			if (fchain)
+				tp = rcu_dereference_bh(fchain->filter_chain);
+		}
+	}
+#endif
+#endif
+
+	return tcf_classify(skb, tp, orig_tp, res, compat_mode);
+}
+EXPORT_SYMBOL(tcf_classify_ingress);
 
 struct tcf_chain_info {
 	struct tcf_proto __rcu **pprev;

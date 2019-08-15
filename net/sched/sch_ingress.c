@@ -52,11 +52,12 @@ static struct tcf_block *ingress_tcf_block(struct Qdisc *sch, unsigned long cl,
 	return q->block;
 }
 
-static void clsact_chain_head_change(struct tcf_proto *tp_head, void *priv)
+static void clsact_chain_head_change(struct tcf_block *block,
+				     struct tcf_proto *tp_head, void *priv)
 {
 	struct mini_Qdisc_pair *miniqp = priv;
 
-	mini_qdisc_pair_swap(miniqp, tp_head);
+	mini_qdisc_pair_swap(miniqp, block, tp_head);
 };
 
 static void ingress_ingress_block_set(struct Qdisc *sch, u32 block_index)
