@@ -950,7 +950,6 @@ mlx5e_tc_add_nic_flow(struct mlx5e_priv *priv,
 	if (attr->action & MLX5_FLOW_CONTEXT_ACTION_MOD_HDR) {
 		err = mlx5e_attach_mod_hdr(priv, flow, parse_attr);
 		flow_act.modify_id = attr->mod_hdr_id;
-		kfree(parse_attr->mod_hdr_actions);
 		if (err)
 			return err;
 	}
@@ -1154,6 +1153,15 @@ static void remove_unready_flow(struct mlx5e_tc_flow *flow)
 	mutex_unlock(&uplink_priv->unready_flows_lock);
 }
 
+static void
+dealloc_mod_hdr_actions(struct mlx5e_tc_flow_parse_attr *parse_attr)
+{
+	kfree(parse_attr->mod_hdr_actions);
+	parse_attr->mod_hdr_actions = 0;
+	parse_attr->max_mod_hdr_actions = 0;
+	parse_attr->num_mod_hdr_actions = 0;
+}
+
 static int
 mlx5e_tc_add_fdb_flow(struct mlx5e_priv *priv,
 		      struct mlx5e_tc_flow *flow,
@@ -1213,7 +1221,7 @@ mlx5e_tc_add_fdb_flow(struct mlx5e_priv *priv,
 
 	if (attr->action & MLX5_FLOW_CONTEXT_ACTION_MOD_HDR) {
 		err = mlx5e_attach_mod_hdr(priv, flow, parse_attr);
-		kfree(parse_attr->mod_hdr_actions);
+		dealloc_mod_hdr_actions(parse_attr);
 		if (err)
 			return err;
 	}
@@ -1289,10 +1297,13 @@ static void mlx5e_tc_del_fdb_flow(struct mlx5e_priv *priv,
 	for (out_index = 0; out_index < MLX5_MAX_FLOW_FWD_VPORTS; out_index++)
 		if (attr->dests[out_index].flags & MLX5_ESW_DEST_ENCAP)
 			mlx5e_detach_encap(priv, flow, out_index);
-	kvfree(attr->parse_attr);
 
-	if (attr->action & MLX5_FLOW_CONTEXT_ACTION_MOD_HDR)
+	if (attr->action & MLX5_FLOW_CONTEXT_ACTION_MOD_HDR) {
+		dealloc_mod_hdr_actions(attr->parse_attr);
 		mlx5e_detach_mod_hdr(priv, flow);
+	}
+
+	kvfree(attr->parse_attr);
 
 	if (attr->action & MLX5_FLOW_CONTEXT_ACTION_COUNT)
 		mlx5_fc_destroy(attr->counter_dev, attr->counter);
@@ -2309,11 +2320,15 @@ static struct mlx5_fields fields[] = {
 	OFFLOAD(UDP_DPORT, 2, udp.dest,   0, udp_dport),
 };
 
-/* On input attr->max_mod_hdr_actions tells how many HW actions can be parsed at
- * max from the SW pedit action. On success, attr->num_mod_hdr_actions
- * says how many HW actions were actually parsed.
+static int alloc_mod_hdr_actions(struct mlx5e_priv *priv,
+				 int namespace,
+				 struct mlx5e_tc_flow_parse_attr *parse_attr);
+/* On success, attr->num_mod_hdr_actions says how many HW actions
+ * were actually parsed. On error, actions should be freed by caller.
  */
-static int offload_pedit_fields(struct pedit_headers_action *hdrs,
+static int offload_pedit_fields(struct mlx5e_priv *priv,
+				int namespace,
+				struct pedit_headers_action *hdrs,
 				struct mlx5e_tc_flow_parse_attr *parse_attr,
 				u32 *action_flags,
 				struct netlink_ext_ack *extack)
@@ -2323,7 +2338,7 @@ static int offload_pedit_fields(struct pedit_headers_action *hdrs,
 						     &parse_attr->spec);
 	void *headers_v = get_match_headers_value(*action_flags,
 						  &parse_attr->spec);
-	int i, action_size, nactions, max_actions, first, last, next_z;
+	int i, action_size, first, last, next_z;
 	void *s_masks_p, *a_masks_p, *vals_p;
 	struct mlx5_fields *f;
 	u8 cmd, field_bsize;
@@ -2332,6 +2347,7 @@ static int offload_pedit_fields(struct pedit_headers_action *hdrs,
 	__be32 mask_be32;
 	__be16 mask_be16;
 	void *action;
+	int err;
 
 	set_masks = &hdrs[0].masks;
 	add_masks = &hdrs[1].masks;
@@ -2339,11 +2355,6 @@ static int offload_pedit_fields(struct pedit_headers_action *hdrs,
 	add_vals = &hdrs[1].vals;
 
 	action_size = MLX5_UN_SZ_BYTES(set_action_in_add_action_in_auto);
-	action = parse_attr->mod_hdr_actions +
-		 parse_attr->num_mod_hdr_actions * action_size;
-
-	max_actions = parse_attr->max_mod_hdr_actions;
-	nactions = parse_attr->num_mod_hdr_actions;
 
 	for (i = 0; i < ARRAY_SIZE(fields); i++) {
 		bool skip;
@@ -2366,13 +2377,6 @@ static int offload_pedit_fields(struct pedit_headers_action *hdrs,
 			NL_SET_ERR_MSG_MOD(extack,
 					   "can't set and add to the same HW field");
 			printk(KERN_WARNING "mlx5: can't set and add to the same HW field (%x)\n", f->field);
-			return -EOPNOTSUPP;
-		}
-
-		if (nactions == max_actions) {
-			NL_SET_ERR_MSG_MOD(extack,
-					   "too many pedit actions, can't offload");
-			printk(KERN_WARNING "mlx5: parsed %d pedit actions, can't do more\n", nactions);
 			return -EOPNOTSUPP;
 		}
 
@@ -2426,6 +2430,17 @@ static int offload_pedit_fields(struct pedit_headers_action *hdrs,
 			return -EOPNOTSUPP;
 		}
 
+		err = alloc_mod_hdr_actions(priv, namespace, parse_attr);
+		if (err) {
+			NL_SET_ERR_MSG_MOD(extack,
+					   "too many pedit actions, can't offload");
+			printk(KERN_WARNING "mlx5: parsed %d pedit actions, can't do more\n",
+			       parse_attr->num_mod_hdr_actions);
+			return err;
+		}
+
+		action = parse_attr->mod_hdr_actions +
+			 parse_attr->num_mod_hdr_actions * action_size;
 		MLX5_SET(set_action_in, action, action_type, cmd);
 		MLX5_SET(set_action_in, action, field, f->field);
 
@@ -2442,11 +2457,9 @@ static int offload_pedit_fields(struct pedit_headers_action *hdrs,
 		else if (field_bsize == 8)
 			MLX5_SET(set_action_in, action, data, *(u8 *)vals_p >> first);
 
-		action += action_size;
-		nactions++;
+		++parse_attr->num_mod_hdr_actions;
 	}
 
-	parse_attr->num_mod_hdr_actions = nactions;
 	return 0;
 }
 
@@ -2460,25 +2473,36 @@ static int mlx5e_flow_namespace_max_modify_action(struct mlx5_core_dev *mdev,
 }
 
 static int alloc_mod_hdr_actions(struct mlx5e_priv *priv,
-				 struct pedit_headers_action *hdrs,
 				 int namespace,
 				 struct mlx5e_tc_flow_parse_attr *parse_attr)
 {
-	int nkeys, action_size, max_actions;
+	int action_size, max_actions;
+	size_t new_sz, old_sz;
+	void *ret;
 
-	nkeys = hdrs[TCA_PEDIT_KEY_EX_CMD_SET].pedits +
-		hdrs[TCA_PEDIT_KEY_EX_CMD_ADD].pedits;
+	if (parse_attr->num_mod_hdr_actions < parse_attr->max_mod_hdr_actions)
+		return 0;
+
 	action_size = MLX5_UN_SZ_BYTES(set_action_in_add_action_in_auto);
 
-	max_actions = mlx5e_flow_namespace_max_modify_action(priv->mdev, namespace);
-	/* can get up to crazingly 16 HW actions in 32 bits pedit SW key */
-	max_actions = min(max_actions, nkeys * 16);
+	max_actions = mlx5e_flow_namespace_max_modify_action(priv->mdev,
+							     namespace);
+	max_actions = min(max_actions,
+			  parse_attr->mod_hdr_actions ?
+				parse_attr->max_mod_hdr_actions * 2 : 1);
+	if (parse_attr->max_mod_hdr_actions == max_actions)
+		return -ENOSPC;
 
-	parse_attr->mod_hdr_actions = kcalloc(max_actions, action_size, GFP_KERNEL);
-	if (!parse_attr->mod_hdr_actions)
+	new_sz = action_size * max_actions;
+	old_sz = parse_attr->max_mod_hdr_actions * action_size;
+	ret = krealloc(parse_attr->mod_hdr_actions, new_sz, GFP_KERNEL);
+	if (!ret)
 		return -ENOMEM;
 
+	memset(ret + old_sz, 0, new_sz - old_sz);
+	parse_attr->mod_hdr_actions = ret;
 	parse_attr->max_mod_hdr_actions = max_actions;
+
 	return 0;
 }
 
@@ -2534,13 +2558,8 @@ static int alloc_tc_pedit_action(struct mlx5e_priv *priv, int namespace,
 	int err;
 	u8 cmd;
 
-	if (!parse_attr->mod_hdr_actions) {
-		err = alloc_mod_hdr_actions(priv, hdrs, namespace, parse_attr);
-		if (err)
-			goto out_err;
-	}
-
-	err = offload_pedit_fields(hdrs, parse_attr, action_flags, extack);
+	err = offload_pedit_fields(priv, namespace, hdrs, parse_attr,
+				   action_flags, extack);
 	if (err < 0)
 		goto out_dealloc_parsed_actions;
 
@@ -2560,8 +2579,7 @@ static int alloc_tc_pedit_action(struct mlx5e_priv *priv, int namespace,
 	return 0;
 
 out_dealloc_parsed_actions:
-	kfree(parse_attr->mod_hdr_actions);
-out_err:
+	dealloc_mod_hdr_actions(parse_attr);
 	return err;
 }
 
@@ -2904,7 +2922,7 @@ static int parse_tc_nic_actions(struct mlx5e_priv *priv,
 		 */
 		if (parse_attr->num_mod_hdr_actions == 0) {
 			action &= ~MLX5_FLOW_CONTEXT_ACTION_MOD_HDR;
-			kfree(parse_attr->mod_hdr_actions);
+			dealloc_mod_hdr_actions(parse_attr);
 		}
 	}
 
@@ -3406,7 +3424,7 @@ static int parse_tc_fdb_actions(struct mlx5e_priv *priv,
 		 */
 		if (parse_attr->num_mod_hdr_actions == 0) {
 			action &= ~MLX5_FLOW_CONTEXT_ACTION_MOD_HDR;
-			kfree(parse_attr->mod_hdr_actions);
+			dealloc_mod_hdr_actions(parse_attr);
 			if (!((action & MLX5_FLOW_CONTEXT_ACTION_VLAN_POP) ||
 			      (action & MLX5_FLOW_CONTEXT_ACTION_VLAN_PUSH)))
 				attr->split_count = 0;
@@ -3730,6 +3748,7 @@ mlx5e_add_nic_flow(struct mlx5e_priv *priv,
 		goto err_free;
 
 	flow_flag_set(flow, OFFLOADED);
+	dealloc_mod_hdr_actions(parse_attr);
 	kvfree(parse_attr);
 	*__flow = flow;
 
@@ -3737,6 +3756,7 @@ mlx5e_add_nic_flow(struct mlx5e_priv *priv,
 
 err_free:
 	mlx5e_flow_put(priv, flow);
+	dealloc_mod_hdr_actions(parse_attr);
 	kvfree(parse_attr);
 out:
 	return err;
