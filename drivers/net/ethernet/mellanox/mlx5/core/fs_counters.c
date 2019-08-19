@@ -64,6 +64,8 @@ struct mlx5_fc {
 	u32 id;
 	bool aging;
 
+	bool virtual;
+	struct mlx5_fc *parent;
 	struct mlx5_fc_cache cache ____cacheline_aligned_in_smp;
 };
 
@@ -137,6 +139,9 @@ static void mlx5_fc_stats_remove(struct mlx5_core_dev *dev,
 {
 	struct mlx5_fc_stats *fc_stats = &dev->priv.fc_stats;
 
+	if (counter->virtual)
+		return;
+
 	list_del(&counter->list);
 
 	spin_lock(&fc_stats->counters_idr_lock);
@@ -150,16 +155,25 @@ static int get_max_bulk_query_len(struct mlx5_core_dev *dev)
 			  (1 << MLX5_CAP_GEN(dev, log_max_flow_counter_bulk)));
 }
 
-static void update_counter_cache(int index, u32 *bulk_raw_data,
-				 struct mlx5_fc_cache *cache)
+static void update_counter_cache(struct mlx5_fc *counter, int index,
+				 u32 *bulk_raw_data)
 {
 	void *stats = MLX5_ADDR_OF(query_flow_counter_out, bulk_raw_data,
 			     flow_statistics[index]);
+	struct mlx5_fc_cache *cache = &counter->cache;
 	u64 packets = MLX5_GET64(traffic_counter, stats, packets);
 	u64 bytes = MLX5_GET64(traffic_counter, stats, octets);
 
 	if (cache->packets == packets)
 		return;
+
+	if (counter->parent) {
+		struct mlx5_fc_cache *cp = &counter->parent->cache;
+
+		cp->packets += (packets - cache->packets);
+		cp->bytes += (bytes - cache->bytes);
+		cp->lastuse = jiffies;
+	}
 
 	cache->packets = packets;
 	cache->bytes = bytes;
@@ -197,21 +211,21 @@ static void mlx5_fc_stats_query_counter_range(struct mlx5_core_dev *dev,
 
 		list_for_each_entry_from(counter, &fc_stats->counters, list) {
 			int counter_index = counter->id - bulk_base_id;
-			struct mlx5_fc_cache *cache = &counter->cache;
 
 			if (counter->id >= bulk_base_id + bulk_len) {
 				query_more_counters = true;
 				break;
 			}
 
-			update_counter_cache(counter_index, data, cache);
+			update_counter_cache(counter, counter_index, data);
 		}
 	}
 }
 
 static void mlx5_fc_free(struct mlx5_core_dev *dev, struct mlx5_fc *counter)
 {
-	mlx5_cmd_fc_free(dev, counter->id);
+	if (!counter->virtual)
+		mlx5_cmd_fc_free(dev, counter->id);
 	kfree(counter);
 }
 
@@ -264,7 +278,8 @@ static void mlx5_fc_stats_work(struct work_struct *work)
 	fc_stats->next_query = now + fc_stats->sampling_interval;
 }
 
-static struct mlx5_fc *mlx5_fc_single_alloc(struct mlx5_core_dev *dev)
+static struct mlx5_fc *mlx5_fc_single_alloc(struct mlx5_core_dev *dev,
+					    bool virtual)
 {
 	struct mlx5_fc *counter;
 	int err;
@@ -273,10 +288,13 @@ static struct mlx5_fc *mlx5_fc_single_alloc(struct mlx5_core_dev *dev)
 	if (!counter)
 		return ERR_PTR(-ENOMEM);
 
-	err = mlx5_cmd_fc_alloc(dev, &counter->id);
-	if (err) {
-		kfree(counter);
-		return ERR_PTR(err);
+	counter->virtual = virtual;
+	if (!counter->virtual) {
+		err = mlx5_cmd_fc_alloc(dev, &counter->id);
+		if (err) {
+			kfree(counter);
+			return ERR_PTR(err);
+		}
 	}
 
 	return counter;
@@ -293,20 +311,27 @@ static struct mlx5_fc *mlx5_fc_acquire(struct mlx5_core_dev *dev, bool aging)
 			return counter;
 	}
 
-	return mlx5_fc_single_alloc(dev);
+	return mlx5_fc_single_alloc(dev, false);
 }
 
-struct mlx5_fc *mlx5_fc_create(struct mlx5_core_dev *dev, bool aging)
+static struct mlx5_fc *_mlx5_fc_create(struct mlx5_core_dev *dev, bool aging,
+				       struct mlx5_fc *parent, bool virtual)
 {
-	struct mlx5_fc *counter = mlx5_fc_acquire(dev, aging);
 	struct mlx5_fc_stats *fc_stats = &dev->priv.fc_stats;
+	struct mlx5_fc *counter;
 	int err;
 
+	if (virtual)
+		counter = mlx5_fc_single_alloc(dev, true);
+	else
+		counter = mlx5_fc_acquire(dev, aging);
 	if (IS_ERR(counter))
 		return counter;
 
 	INIT_LIST_HEAD(&counter->list);
 	counter->aging = aging;
+	counter->parent = parent;
+	counter->virtual = virtual;
 
 	if (aging) {
 		u32 id = counter->id;
@@ -315,20 +340,22 @@ struct mlx5_fc *mlx5_fc_create(struct mlx5_core_dev *dev, bool aging)
 		counter->lastbytes = counter->cache.bytes;
 		counter->lastpackets = counter->cache.packets;
 
-		idr_preload(GFP_KERNEL);
-		spin_lock(&fc_stats->counters_idr_lock);
+		if (!virtual) {
+			idr_preload(GFP_KERNEL);
+			spin_lock(&fc_stats->counters_idr_lock);
 
-		err = idr_alloc_u32(&fc_stats->counters_idr, counter, &id, id,
-				    GFP_NOWAIT);
+			err = idr_alloc_u32(&fc_stats->counters_idr, counter,
+					    &id, id, GFP_NOWAIT);
 
-		spin_unlock(&fc_stats->counters_idr_lock);
-		idr_preload_end();
-		if (err)
-			goto err_out_alloc;
+			spin_unlock(&fc_stats->counters_idr_lock);
+			idr_preload_end();
+			if (err)
+				goto err_out_alloc;
 
-		llist_add(&counter->addlist, &fc_stats->addlist);
+			llist_add(&counter->addlist, &fc_stats->addlist);
 
-		mod_delayed_work(fc_stats->wq, &fc_stats->work, 0);
+			mod_delayed_work(fc_stats->wq, &fc_stats->work, 0);
+		}
 	}
 
 	return counter;
@@ -336,6 +363,24 @@ struct mlx5_fc *mlx5_fc_create(struct mlx5_core_dev *dev, bool aging)
 err_out_alloc:
 	mlx5_fc_release(dev, counter);
 	return ERR_PTR(err);
+}
+
+struct mlx5_fc *mlx5_fc_create_linked(struct mlx5_core_dev *dev, bool aging,
+				      struct mlx5_fc *parent)
+{
+	return _mlx5_fc_create(dev, aging, parent, false);
+}
+EXPORT_SYMBOL(mlx5_fc_create_linked);
+
+struct mlx5_fc *mlx5_fc_create_virtual(struct mlx5_core_dev *dev, bool aging)
+{
+	return _mlx5_fc_create(dev, aging, NULL, true);
+}
+EXPORT_SYMBOL(mlx5_fc_create_virtual);
+
+struct mlx5_fc *mlx5_fc_create(struct mlx5_core_dev *dev, bool aging)
+{
+	return _mlx5_fc_create(dev, aging, NULL, false);
 }
 EXPORT_SYMBOL(mlx5_fc_create);
 
@@ -421,6 +466,9 @@ void mlx5_cleanup_fc_stats(struct mlx5_core_dev *dev)
 int mlx5_fc_query(struct mlx5_core_dev *dev, struct mlx5_fc *counter,
 		  u64 *packets, u64 *bytes)
 {
+	if (counter->virtual)
+		return -EOPNOTSUPP;
+
 	return mlx5_cmd_fc_query(dev, counter->id, packets, bytes);
 }
 EXPORT_SYMBOL(mlx5_fc_query);
@@ -443,6 +491,11 @@ void mlx5_fc_query_cached(struct mlx5_fc *counter,
 
 	counter->lastbytes = c.bytes;
 	counter->lastpackets = c.packets;
+}
+
+u64 mlx5_fc_query_cached_lastuse(struct mlx5_fc *counter)
+{
+	return counter->cache.lastuse;
 }
 
 void mlx5_fc_queue_stats_work(struct mlx5_core_dev *dev,
