@@ -755,6 +755,15 @@ static struct mlx5e_etype_proto ttc_tunnel_rules[] = {
 		.etype = ETH_P_IPV6,
 		.proto = IPPROTO_IPIP,
 	},
+	[MLX5E_TT_IPV4_IPV6] = {
+		.etype = ETH_P_IP,
+		.proto = IPPROTO_IPV6,
+	},
+	[MLX5E_TT_IPV6_IPV6] = {
+		.etype = ETH_P_IPV6,
+		.proto = IPPROTO_IPV6,
+	},
+
 };
 
 bool mlx5e_tunnel_proto_supported(struct mlx5_core_dev *mdev, u8 proto_type)
@@ -763,6 +772,7 @@ bool mlx5e_tunnel_proto_supported(struct mlx5_core_dev *mdev, u8 proto_type)
 	case IPPROTO_GRE:
 		return MLX5_CAP_ETH(mdev, tunnel_stateless_gre);
 	case IPPROTO_IPIP:
+	case IPPROTO_IPV6:
 		return MLX5_CAP_ETH(mdev, tunnel_stateless_ip_over_ip);
 	default:
 		return false;
