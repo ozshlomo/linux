@@ -703,7 +703,7 @@ struct pf_frame {
 	int depth;
 };
 
-static bool mkey_is_eq(struct mlx5_core_mkey *mmkey, u32 key)
+static bool mkey_is_eq(struct mlx5_ib_mkey *mmkey, u32 key)
 {
 	if (!mmkey)
 		return false;
@@ -712,7 +712,7 @@ static bool mkey_is_eq(struct mlx5_core_mkey *mmkey, u32 key)
 	return mmkey->key == key;
 }
 
-static int get_indirect_num_descs(struct mlx5_core_mkey *mmkey)
+static int get_indirect_num_descs(struct mlx5_ib_mkey *mmkey)
 {
 	struct mlx5_ib_mw *mw;
 	struct mlx5_ib_devx_mr *devx_mr;
@@ -725,6 +725,17 @@ static int get_indirect_num_descs(struct mlx5_core_mkey *mmkey)
 	devx_mr = container_of(mmkey, struct mlx5_ib_devx_mr,
 			       mmkey);
 	return devx_mr->ndescs;
+}
+
+static int
+mlx5_ib_query_mkey(struct mlx5_core_dev *dev, struct mlx5_ib_mkey *mkey,
+		   u32 *out, int outlen)
+{
+	u32 in[MLX5_ST_SZ_DW(query_mkey_in)] = {};
+
+	MLX5_SET(query_mkey_in, in, opcode, MLX5_CMD_OP_QUERY_MKEY);
+	MLX5_SET(query_mkey_in, in, mkey_index, mlx5_mkey_to_idx(mkey->key));
+	return mlx5_cmd_exec(dev, in, sizeof(in), out, outlen);
 }
 
 /*
@@ -747,7 +758,7 @@ static int pagefault_single_data_segment(struct mlx5_ib_dev *dev,
 	int npages = 0, srcu_key, ret, i, outlen, cur_outlen = 0, depth = 0;
 	bool prefetch = flags & MLX5_PF_FLAGS_PREFETCH;
 	struct pf_frame *head = NULL, *frame;
-	struct mlx5_core_mkey *mmkey;
+	struct mlx5_ib_mkey *mmkey;
 	struct mlx5_ib_mr *mr;
 	struct mlx5_klm *pklm;
 	u32 *out = NULL;
@@ -760,7 +771,7 @@ static int pagefault_single_data_segment(struct mlx5_ib_dev *dev,
 	bcnt -= *bytes_committed;
 
 next_mr:
-	mmkey = xa_load(&dev->mdev->priv.mkey_table, mlx5_base_mkey(key));
+	mmkey = xa_load(&dev->mkey_table, mlx5_base_mkey(key));
 	if (!mkey_is_eq(mmkey, key)) {
 		mlx5_ib_dbg(dev, "failed to find mkey %x\n", key);
 		ret = -EFAULT;
@@ -836,7 +847,7 @@ next_mr:
 		pklm = (struct mlx5_klm *)MLX5_ADDR_OF(query_mkey_out, out,
 						       bsf0_klm0_pas_mtt0_1);
 
-		ret = mlx5_core_query_mkey(dev->mdev, mmkey, out, outlen);
+		ret = mlx5_ib_query_mkey(dev->mdev, mmkey, out, outlen);
 		if (ret)
 			goto srcu_unlock;
 
@@ -1393,6 +1404,8 @@ static void mlx5_ib_eqe_pf_action(struct work_struct *work)
 	mempool_free(pfault, eq->pool);
 }
 
+#define MLX5_IB_ODP_24BIT_MASK ((1 << 24) - 1)
+
 static void mlx5_ib_eq_pf_process(struct mlx5_ib_pf_eq *eq)
 {
 	struct mlx5_eqe_page_fault *pf_eqe;
@@ -1422,7 +1435,7 @@ static void mlx5_ib_eq_pf_process(struct mlx5_ib_pf_eq *eq)
 				be32_to_cpu(pf_eqe->rdma.pftype_token) >> 24;
 			pfault->token =
 				be32_to_cpu(pf_eqe->rdma.pftype_token) &
-				MLX5_24BIT_MASK;
+				MLX5_IB_ODP_24BIT_MASK;
 			pfault->rdma.r_key =
 				be32_to_cpu(pf_eqe->rdma.r_key);
 			pfault->rdma.packet_size =
@@ -1449,7 +1462,7 @@ static void mlx5_ib_eq_pf_process(struct mlx5_ib_pf_eq *eq)
 				be32_to_cpu(pf_eqe->wqe.token);
 			pfault->wqe.wq_num =
 				be32_to_cpu(pf_eqe->wqe.pftype_wq) &
-				MLX5_24BIT_MASK;
+				MLX5_IB_ODP_24BIT_MASK;
 			pfault->wqe.wqe_index =
 				be16_to_cpu(pf_eqe->wqe.wqe_index);
 			pfault->wqe.packet_size =
@@ -1675,10 +1688,10 @@ static void num_pending_prefetch_dec(struct mlx5_ib_dev *dev,
 	srcu_key = srcu_read_lock(&dev->mr_srcu);
 
 	for (i = from; i < num_sge; ++i) {
-		struct mlx5_core_mkey *mmkey;
+		struct mlx5_ib_mkey *mmkey;
 		struct mlx5_ib_mr *mr;
 
-		mmkey = xa_load(&dev->mdev->priv.mkey_table,
+		mmkey = xa_load(&dev->mkey_table,
 				mlx5_base_mkey(sg_list[i].lkey));
 		mr = container_of(mmkey, struct mlx5_ib_mr, mmkey);
 		atomic_dec(&mr->num_pending_prefetch);
@@ -1695,10 +1708,10 @@ static bool num_pending_prefetch_inc(struct ib_pd *pd,
 	u32 i;
 
 	for (i = 0; i < num_sge; ++i) {
-		struct mlx5_core_mkey *mmkey;
+		struct mlx5_ib_mkey *mmkey;
 		struct mlx5_ib_mr *mr;
 
-		mmkey = xa_load(&dev->mdev->priv.mkey_table,
+		mmkey = xa_load(&dev->mkey_table,
 				mlx5_base_mkey(sg_list[i].lkey));
 		if (!mmkey || mmkey->key != sg_list[i].lkey) {
 			ret = false;

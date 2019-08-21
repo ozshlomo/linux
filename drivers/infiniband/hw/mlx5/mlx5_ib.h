@@ -584,6 +584,20 @@ struct mlx5_ib_dm {
 					  IB_ACCESS_REMOTE_READ   |\
 					  IB_ZERO_BASED)
 
+struct mlx5_ib_mkey {
+	u64 iova;
+	u64 size;
+	u32 key;
+	u32 pd;
+	u32 type;
+};
+
+enum {
+	MLX5_MKEY_MR = 1,
+	MLX5_MKEY_MW,
+	MLX5_MKEY_INDIRECT_DEVX,
+};
+
 struct mlx5_ib_mr {
 	struct ib_mr		ibmr;
 	void			*descs;
@@ -595,7 +609,7 @@ struct mlx5_ib_mr {
 	int			max_descs;
 	int			desc_size;
 	int			access_mode;
-	struct mlx5_core_mkey	mmkey;
+	struct mlx5_ib_mkey	mmkey;
 	struct ib_umem	       *umem;
 	struct mlx5_shared_mr_info	*smr_info;
 	struct list_head	list;
@@ -631,12 +645,12 @@ static inline bool is_odp_mr(struct mlx5_ib_mr *mr)
 
 struct mlx5_ib_mw {
 	struct ib_mw		ibmw;
-	struct mlx5_core_mkey	mmkey;
+	struct mlx5_ib_mkey	mmkey;
 	int			ndescs;
 };
 
 struct mlx5_ib_devx_mr {
-	struct mlx5_core_mkey	mmkey;
+	struct mlx5_ib_mkey	mmkey;
 	int			ndescs;
 	struct rcu_head		rcu;
 };
@@ -961,6 +975,9 @@ struct mlx5_ib_dev {
 	/* sync used page count stats
 	 */
 	struct mlx5_ib_resources	devr;
+
+	struct xarray			mkey_table;
+	atomic_t			mkey_var;
 	struct mlx5_mr_cache		cache;
 	struct timer_list		delay_timer;
 	/* Prevents soft lock on massive reg MRs */
@@ -1038,7 +1055,7 @@ static inline struct mlx5_ib_rwq *to_mibrwq(struct mlx5_core_qp *core_qp)
 	return container_of(core_qp, struct mlx5_ib_rwq, core_qp);
 }
 
-static inline struct mlx5_ib_mr *to_mibmr(struct mlx5_core_mkey *mmkey)
+static inline struct mlx5_ib_mr *to_mibmr(struct mlx5_ib_mkey *mmkey)
 {
 	return container_of(mmkey, struct mlx5_ib_mr, mmkey);
 }

@@ -47,6 +47,7 @@
 #include <linux/interrupt.h>
 #include <linux/idr.h>
 #include <linux/notifier.h>
+#include <linux/refcount.h>
 
 #include <linux/mlx5/device.h>
 #include <linux/mlx5/doorbell.h>
@@ -362,22 +363,6 @@ struct mlx5_core_sig_ctx {
 	u32			sigerr_count;
 };
 
-enum {
-	MLX5_MKEY_MR = 1,
-	MLX5_MKEY_MW,
-	MLX5_MKEY_INDIRECT_DEVX,
-};
-
-struct mlx5_core_mkey {
-	u64			iova;
-	u64			size;
-	u32			key;
-	u32			pd;
-	u32			type;
-};
-
-#define MLX5_24BIT_MASK		((1 << 24) - 1)
-
 enum mlx5_res_type {
 	MLX5_RES_QP	= MLX5_EVENT_QUEUE_TYPE_QP,
 	MLX5_RES_RQ	= MLX5_EVENT_QUEUE_TYPE_RQ,
@@ -390,7 +375,7 @@ enum mlx5_res_type {
 
 struct mlx5_core_rsc_common {
 	enum mlx5_res_type	res;
-	atomic_t		refcount;
+	refcount_t		refcount;
 	struct completion	free;
 };
 
@@ -555,8 +540,6 @@ struct mlx5_priv {
 	struct dentry	       *cmdif_debugfs;
 	/* end: qp staff */
 
-	struct xarray           mkey_table;
-
 	/* start: alloc staff */
 	/* protect buffer alocation according to numa node */
 	struct mutex            alloc_mutex;
@@ -566,10 +549,6 @@ struct mlx5_priv {
 	struct list_head        pgdir_list;
 	/* end: alloc staff */
 	struct dentry	       *dbg_root;
-
-	/* protect mkey key part */
-	spinlock_t		mkey_lock;
-	u8			mkey_key;
 
 	struct list_head        dev_list;
 	struct list_head        ctx_list;
@@ -620,8 +599,8 @@ struct mlx5_td {
 
 struct mlx5e_resources {
 	u32                        pdn;
+	u32                        mkey;
 	struct mlx5_td             td;
-	struct mlx5_core_mkey      mkey;
 	struct mlx5_sq_bfreg       bfreg;
 };
 
@@ -929,23 +908,7 @@ struct mlx5_cmd_mailbox *mlx5_alloc_cmd_mailbox_chain(struct mlx5_core_dev *dev,
 						      gfp_t flags, int npages);
 void mlx5_free_cmd_mailbox_chain(struct mlx5_core_dev *dev,
 				 struct mlx5_cmd_mailbox *head);
-void mlx5_init_mkey_table(struct mlx5_core_dev *dev);
-void mlx5_cleanup_mkey_table(struct mlx5_core_dev *dev);
-int mlx5_core_create_mkey_cb(struct mlx5_core_dev *dev,
-			     struct mlx5_core_mkey *mkey,
-			     struct mlx5_async_ctx *async_ctx, u32 *in,
-			     int inlen, u32 *out, int outlen,
-			     mlx5_async_cbk_t callback,
-			     struct mlx5_async_work *context);
-int mlx5_core_create_mkey(struct mlx5_core_dev *dev,
-			  struct mlx5_core_mkey *mkey,
-			  u32 *in, int inlen);
-int mlx5_core_destroy_mkey(struct mlx5_core_dev *dev,
-			   struct mlx5_core_mkey *mkey);
-int mlx5_core_query_mkey(struct mlx5_core_dev *dev, struct mlx5_core_mkey *mkey,
-			 u32 *out, int outlen);
-int mlx5_core_alloc_pd(struct mlx5_core_dev *dev, u32 *pdn);
-int mlx5_core_dealloc_pd(struct mlx5_core_dev *dev, u32 pdn);
+
 int mlx5_pagealloc_init(struct mlx5_core_dev *dev);
 void mlx5_pagealloc_cleanup(struct mlx5_core_dev *dev);
 void mlx5_pagealloc_start(struct mlx5_core_dev *dev);
@@ -978,9 +941,6 @@ void mlx5_db_free(struct mlx5_core_dev *dev, struct mlx5_db *db);
 const char *mlx5_command_str(int command);
 void mlx5_cmdif_debugfs_init(struct mlx5_core_dev *dev);
 void mlx5_cmdif_debugfs_cleanup(struct mlx5_core_dev *dev);
-int mlx5_core_create_psv(struct mlx5_core_dev *dev, u32 pdn,
-			 int npsvs, u32 *sig_index);
-int mlx5_core_destroy_psv(struct mlx5_core_dev *dev, int psv_num);
 void mlx5_core_put_rsc(struct mlx5_core_rsc_common *common);
 int mlx5_query_odp_caps(struct mlx5_core_dev *dev,
 			struct mlx5_odp_caps *odp_caps);

@@ -922,6 +922,7 @@ static bool devx_is_general_cmd(void *in, struct mlx5_ib_dev *dev)
 	case MLX5_CMD_OP_QUERY_CONG_STATUS:
 	case MLX5_CMD_OP_QUERY_CONG_PARAMS:
 	case MLX5_CMD_OP_QUERY_CONG_STATISTICS:
+	case MLX5_CMD_OP_QUERY_LAG:
 		return true;
 	default:
 		return false;
@@ -1227,7 +1228,7 @@ static int devx_handle_mkey_indirect(struct devx_obj *obj,
 				     void *in, void *out)
 {
 	struct mlx5_ib_devx_mr *devx_mr = &obj->devx_mr;
-	struct mlx5_core_mkey *mkey;
+	struct mlx5_ib_mkey *mkey;
 	void *mkc;
 	u8 key;
 
@@ -1242,7 +1243,7 @@ static int devx_handle_mkey_indirect(struct devx_obj *obj,
 	mkey->pd = MLX5_GET(mkc, mkc, pd);
 	devx_mr->ndescs = MLX5_GET(mkc, mkc, translations_octword_size);
 
-	return xa_err(xa_store(&dev->mdev->priv.mkey_table,
+	return xa_err(xa_store(&dev->mkey_table,
 			       mlx5_base_mkey(mkey->key), mkey, GFP_KERNEL));
 }
 
@@ -1294,7 +1295,7 @@ static void devx_free_indirect_mkey(struct rcu_head *rcu)
  */
 static void devx_cleanup_mkey(struct devx_obj *obj)
 {
-	xa_erase(&obj->ib_dev->mdev->priv.mkey_table,
+	xa_erase(&obj->ib_dev->mkey_table,
 		 mlx5_base_mkey(obj->devx_mr.mmkey.key));
 }
 

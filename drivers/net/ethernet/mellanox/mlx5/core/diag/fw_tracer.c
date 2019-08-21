@@ -1,35 +1,8 @@
-/*
- * Copyright (c) 2018, Mellanox Technologies. All rights reserved.
- *
- * This software is available to you under a choice of one of two
- * licenses.  You may choose to be licensed under the terms of the GNU
- * General Public License (GPL) Version 2, available from the file
- * COPYING in the main directory of this source tree, or the
- * OpenIB.org BSD license below:
- *
- *     Redistribution and use in source and binary forms, with or
- *     without modification, are permitted provided that the following
- *     conditions are met:
- *
- *      - Redistributions of source code must retain the above
- *        copyright notice, this list of conditions and the following
- *        disclaimer.
- *
- *      - Redistributions in binary form must reproduce the above
- *        copyright notice, this list of conditions and the following
- *        disclaimer in the documentation and/or other materials
- *        provided with the distribution.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
- * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
- * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
- * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
- * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
- * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
- * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
- */
+// SPDX-License-Identifier: GPL-2.0 OR Linux-OpenIB
+// Copyright (c) 2018, Mellanox Technologies. All rights reserved.
+
 #define CREATE_TRACE_POINTS
+#include "lib/mlx5.h"
 #include "lib/eq.h"
 #include "fw_tracer.h"
 #include "fw_tracer_tracepoint.h"
@@ -204,7 +177,7 @@ static int mlx5_fw_tracer_create_mkey(struct mlx5_fw_tracer *tracer)
 		 DIV_ROUND_UP(TRACER_BUFFER_PAGE_NUM, 2));
 	MLX5_SET64(mkc, mkc, start_addr, tracer->buff.dma);
 	MLX5_SET64(mkc, mkc, len, tracer->buff.size);
-	err = mlx5_core_create_mkey(dev, &tracer->buff.mkey, in, inlen);
+	err = mlx5_create_mkey(dev, in, inlen, &tracer->buff.mkey);
 	if (err)
 		mlx5_core_warn(dev, "FWTracer: Failed to create mkey, %d\n", err);
 
@@ -742,7 +715,7 @@ static int mlx5_fw_tracer_set_mtrc_conf(struct mlx5_fw_tracer *tracer)
 	MLX5_SET(mtrc_conf, in, trace_mode, TRACE_TO_MEMORY);
 	MLX5_SET(mtrc_conf, in, log_trace_buffer_size,
 		 ilog2(TRACER_BUFFER_PAGE_NUM));
-	MLX5_SET(mtrc_conf, in, trace_mkey, tracer->buff.mkey.key);
+	MLX5_SET(mtrc_conf, in, trace_mkey, tracer->buff.mkey);
 
 	err = mlx5_core_access_reg(dev, in, sizeof(in), out, sizeof(out),
 				   MLX5_REG_MTRC_CONF, 0, 1);
@@ -1040,7 +1013,7 @@ void mlx5_fw_tracer_cleanup(struct mlx5_fw_tracer *tracer)
 	if (tracer->owner)
 		mlx5_fw_tracer_ownership_release(tracer);
 
-	mlx5_core_destroy_mkey(tracer->dev, &tracer->buff.mkey);
+	mlx5_destroy_mkey(tracer->dev, tracer->buff.mkey);
 	mlx5_core_dealloc_pd(tracer->dev, tracer->buff.pdn);
 }
 
