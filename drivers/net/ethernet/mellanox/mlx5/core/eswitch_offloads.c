@@ -1059,7 +1059,9 @@ static struct mlx5_flow_handle *esw_add_restore_rule(struct mlx5_eswitch *esw,
 	misc = MLX5_ADDR_OF(fte_match_param, spec->match_value, misc_parameters_2);
 	MLX5_SET(fte_match_set_misc2, misc, metadata_reg_c_0, tag);
 	spec->match_criteria_enable = MLX5_MATCH_MISC_PARAMETERS_2;
-	flow_act.action = MLX5_FLOW_CONTEXT_ACTION_FWD_DEST;
+	flow_act.action = MLX5_FLOW_CONTEXT_ACTION_FWD_DEST |
+		MLX5_FLOW_CONTEXT_ACTION_MOD_HDR;
+	flow_act.modify_id = esw->offloads.restore_copy_hdr_id;
 
 	flow_context = &spec->flow_context;
 	flow_context->flags |= FLOW_CONTEXT_HAS_TAG;
@@ -1900,12 +1902,14 @@ static void esw_destroy_restore_table(struct mlx5_eswitch *esw)
 {
 	struct mlx5_esw_offload *offloads = &esw->offloads;
 
+	mlx5_modify_header_dealloc(esw->dev, offloads->restore_copy_hdr_id);
 	mlx5_destroy_flow_group(offloads->restore_group);
 	mlx5_destroy_flow_table(offloads->ft_offloads_restore);
 }
 
 static int esw_create_restore_table(struct mlx5_eswitch *esw)
 {
+	u8 modact[MLX5_UN_SZ_BYTES(set_action_in_add_action_in_auto)] = {};
 	int inlen = MLX5_ST_SZ_BYTES(create_flow_group_in);
 	struct mlx5_flow_table_attr ft_attr = {};
 	struct mlx5_core_dev *dev = esw->dev;
@@ -1913,8 +1917,8 @@ static int esw_create_restore_table(struct mlx5_eswitch *esw)
 	void *match_criteria, *misc;
 	struct mlx5_flow_table *ft;
 	struct mlx5_flow_group *g;
+	int mod_hdr_id, err = 0;
 	u32 *flow_group_in;
-	int err = 0;
 
 	ns = mlx5_get_flow_namespace(dev, MLX5_FLOW_NAMESPACE_OFFLOADS);
 	if (!ns) {
@@ -1952,11 +1956,27 @@ static int esw_create_restore_table(struct mlx5_eswitch *esw)
 		goto err_group;
 	}
 
+	MLX5_SET(copy_action_in, modact, action_type, MLX5_ACTION_TYPE_COPY);
+	MLX5_SET(copy_action_in, modact, src_field, MLX5_ACTION_IN_FIELD_METADATA_REG_C_1);
+	MLX5_SET(copy_action_in, modact, src_offset, 0);
+	MLX5_SET(copy_action_in, modact, dst_field, MLX5_ACTION_IN_FIELD_METADATA_REG_B);
+	MLX5_SET(copy_action_in, modact, dst_offset, 0);
+	MLX5_SET(copy_action_in, modact, length, 0);
+	err = mlx5_modify_header_alloc(esw->dev, MLX5_FLOW_NAMESPACE_KERNEL,
+				       1, modact, &mod_hdr_id);
+	if (err) {
+		esw_warn(dev, "Failed to create restore mod header err(%d)\n", err);
+		goto err_mod_hdr;
+	}
+
 	esw->offloads.ft_offloads_restore = ft;
 	esw->offloads.restore_group = g;
+	esw->offloads.restore_copy_hdr_id = mod_hdr_id;
 
 	return 0;
 
+err_mod_hdr:
+	mlx5_destroy_flow_group(g);
 err_group:
 	mlx5_destroy_flow_table(ft);
 out_free:

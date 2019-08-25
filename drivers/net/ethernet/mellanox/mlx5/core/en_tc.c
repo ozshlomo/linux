@@ -152,7 +152,7 @@ struct mlx5e_tc_flow_parse_attr {
 #define MLX5E_TC_TABLE_NUM_GROUPS 4
 #define MLX5E_TC_TABLE_MAX_GROUP_SIZE BIT(16)
 
-int __rcu (*tc_skb_update_hook)(struct sk_buff *skb, u32 reg_c0);
+int __rcu (*tc_skb_update_hook)(struct sk_buff *skb, u32 reg_c0, u32 reg_c1);
 
 struct mlx5e_hairpin {
 	struct mlx5_hairpin *pair;
@@ -2744,6 +2744,13 @@ static struct match_mapping_params match_mappings_arr[] = {
 		.soffset = MLX5_BYTE_OFF(fte_match_param,
 					 misc_parameters_2.metadata_reg_c_0),
 	},
+	[mp_tunnel_miss] = { /* and mp_tupleid */
+		.mfield = MLX5_ACTION_IN_FIELD_METADATA_REG_C_1,
+		.moffset = 0,
+		.mlen = 4,
+		.soffset = MLX5_BYTE_OFF(fte_match_param,
+					 misc_parameters_2.metadata_reg_c_1),
+	},
 	[mp_tunnel_match] = {
 		.mfield = MLX5_ACTION_IN_FIELD_METADATA_REG_C_5,
 		.moffset = 0,
@@ -2823,6 +2830,9 @@ struct tunnel_mapping {
 
 	struct net_device *dev;
 
+	struct list_head dwork_entry;
+	struct delayed_work dwork;
+	struct rcu_head rcu;
 	struct idr *idr;
 };
 
@@ -2889,6 +2899,9 @@ static int get_tunnel_mapping(struct mlx5e_priv *priv,
 attach_flow:
 	list_add(&flow->tunnel, &mp->flows);
 
+	if (!flow->esw_attr->chain)
+		get_direct_match_mapping(priv, flow->esw_attr, mp_tunnel_miss,
+					 mp->match_id, 0xFFFFFFFF, true);
 	get_direct_match_mapping(priv, flow->esw_attr, mp_tunnel_match,
 				 mp->match_id, 0xFFFFFFFF, !flow->esw_attr->chain);
 
@@ -2901,16 +2914,30 @@ out_err_idr:
 
 static void del_tunnel_mapping(struct tunnel_mapping *mp)
 {
-	hash_del(&mp->tunnel_hlist);
-
 	dev_put(mp->dev);
 
 	idr_remove(mp->idr, mp->match_id);
+	kfree_rcu(mp, rcu);
 }
 
+static void put_tunnel_mapping_work(struct work_struct *work)
+{
+	struct tunnel_mapping *mp = container_of(work, struct tunnel_mapping,
+						 dwork.work);
+
+	list_del(&mp->dwork_entry);
+	del_tunnel_mapping(mp);
+}
+
+/* We wait some time to release the mapping, since a quick delete and add
+ * might get the same id from idr, while a packet marked with the old
+ * mapping arrives from hardware and can use the old mapping.
+ */
+#define PUT_TUNNEL_GRACE_PERIOD 2000
 static void put_tunnel_mapping(struct mlx5e_priv *priv,
 			       struct mlx5e_tc_flow *flow)
 {
+	unsigned long dt = msecs_to_jiffies(PUT_TUNNEL_GRACE_PERIOD);
 	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
 	struct list_head *next = flow->tunnel.next;
 	struct mlx5e_rep_priv *uplink_rpriv;
@@ -2929,7 +2956,34 @@ static void put_tunnel_mapping(struct mlx5e_priv *priv,
 		return;
 
 	mp = list_entry(next, struct tunnel_mapping, flows);
-	del_tunnel_mapping(mp);
+	hash_del(&mp->tunnel_hlist);
+
+	INIT_DELAYED_WORK(&mp->dwork, put_tunnel_mapping_work);
+	if (queue_delayed_work(esw->work_queue, &mp->dwork, dt)) {
+		list_add(&mp->dwork_entry, &up->tunnel_pending_work);
+		return;
+	}
+
+	WARN_ON_ONCE(1);
+}
+
+static void flush_tunnel_mapping_work(struct mlx5_eswitch *esw,
+				      struct mlx5_rep_uplink_priv *up)
+{
+	struct list_head *pos, *tmp;
+	struct tunnel_mapping *mp;
+
+	list_for_each_safe(pos, tmp, &up->tunnel_pending_work) {
+		mp = list_entry(pos, struct tunnel_mapping, dwork_entry);
+
+		if (!cancel_delayed_work(&mp->dwork))
+			continue;
+
+		put_tunnel_mapping_work(&mp->dwork.work);
+	}
+
+	/* Wait for work that wasn't canceled */
+	flush_workqueue(esw->work_queue);
 }
 
 static bool actions_match_supported(struct mlx5e_priv *priv,
@@ -4362,7 +4416,7 @@ void mlx5e_tc_nic_cleanup(struct mlx5e_priv *priv)
 	mutex_destroy(&tc->t_lock);
 }
 
-static int mlx5e_update_skb(struct sk_buff *skb, u32 reg_c0);
+static int mlx5e_update_skb(struct sk_buff *skb, u32 reg_c0, u32 reg_c1);
 int mlx5e_tc_esw_init(struct rhashtable *tc_ht)
 {
 	struct mlx5_rep_uplink_priv *uplink_priv;
@@ -4370,6 +4424,7 @@ int mlx5e_tc_esw_init(struct rhashtable *tc_ht)
 
 	uplink_priv = container_of(tc_ht, struct mlx5_rep_uplink_priv, tc_ht);
 	idr_init(&uplink_priv->tunnel_ids);
+	INIT_LIST_HEAD(&uplink_priv->tunnel_pending_work);
 
 	err = rhashtable_init(tc_ht, &tc_ht_params);
 	if (!err)
@@ -4381,6 +4436,9 @@ int mlx5e_tc_esw_init(struct rhashtable *tc_ht)
 void mlx5e_tc_esw_cleanup(struct rhashtable *tc_ht)
 {
 	struct mlx5_rep_uplink_priv *uplink_priv;
+	struct mlx5e_rep_priv *rpriv;
+	struct mlx5_eswitch *esw;
+	struct mlx5e_priv *priv;
 
 	RCU_INIT_POINTER(tc_skb_update_hook, NULL);
 	synchronize_rcu();
@@ -4388,6 +4446,11 @@ void mlx5e_tc_esw_cleanup(struct rhashtable *tc_ht)
 	rhashtable_free_and_destroy(tc_ht, _mlx5e_tc_del_flow, NULL);
 
 	uplink_priv = container_of(tc_ht, struct mlx5_rep_uplink_priv, tc_ht);
+	rpriv = container_of(uplink_priv, struct mlx5e_rep_priv, uplink_priv);
+	priv = netdev_priv(rpriv->netdev);
+	esw = priv->mdev->priv.eswitch;
+
+	flush_tunnel_mapping_work(esw, uplink_priv);
 	idr_destroy(&uplink_priv->tunnel_ids);
 }
 
@@ -4421,14 +4484,47 @@ void mlx5e_tc_reoffload_flows_work(struct work_struct *work)
 	mutex_unlock(&rpriv->unready_flows_lock);
 }
 
-static int mlx5e_update_skb(struct sk_buff *skb, u32 reg_c0)
+static int mlx5e_restore_tunnel(struct mlx5_rep_uplink_priv *uplink_priv,
+				struct sk_buff *skb, u32 tunnel_id)
+{
+	struct tunnel_match_key *key;
+	struct metadata_dst *tun_dst;
+	struct tunnel_mapping *mp;
+
+	/* TODO: Use xarray? but what about backporting ? */
+	mp = idr_find(&uplink_priv->tunnel_ids, tunnel_id);
+	if (!mp)
+		return 0;
+	key = &mp->key;
+
+	tun_dst = tun_rx_dst(0);
+	if (!tun_dst) {
+		WARN_ON(1);
+		return -ENOMEM;
+	}
+
+	ip_tunnel_key_init(&tun_dst->u.tun_info.key,
+			   key->tun.enc_ipv4.src, key->tun.enc_ipv4.dst,
+			   0, 64, /* tos, ttl */
+			   0, /* label */
+			   key->tun.enc_tp.src, key->tun.enc_tp.dst,
+			   key32_to_tunnel_id(key->tun.enc_key_id.keyid),
+			   TUNNEL_KEY);
+
+	skb_dst_set(skb, (struct dst_entry *)tun_dst);
+	skb->dev = mp->dev;
+
+	return 0;
+}
+
+static int mlx5e_update_skb(struct sk_buff *skb, u32 reg_c0, u32 reg_c1)
 {
 	struct mlx5_rep_uplink_priv *uplink_priv;
 	struct mlx5e_rep_priv *uplink_rpriv;
+	u32 chain = 0, tunnel_id = 0;
 	struct tc_skb_ext *chainp;
 	struct mlx5_eswitch *esw;
 	struct mlx5e_priv *priv;
-	u32 chain = 0;
 
 	if (!mlx5e_eswitch_rep(skb->dev))
 		return 0;
@@ -4438,8 +4534,12 @@ static int mlx5e_update_skb(struct sk_buff *skb, u32 reg_c0)
 	uplink_rpriv = mlx5_eswitch_get_uplink_priv(esw, REP_ETH);
 	uplink_priv = &uplink_rpriv->uplink_priv;
 
-	if (!reg_c0)
+	if (!reg_c0) {
+		if (WARN_ON_ONCE(reg_c1))
+			netdev_warn(priv->netdev, "reg_c1 should be zero, but it's %d\n",
+				    reg_c1);
 		return 0;
+	}
 
 	chain = mlx5_eswitch_get_chain_for_tag(esw, reg_c0);
 	if (WARN_ON_ONCE(chain == 0))
@@ -4452,6 +4552,9 @@ static int mlx5e_update_skb(struct sk_buff *skb, u32 reg_c0)
 	}
 
 	chainp->chain = chain;
+
+	tunnel_id = reg_c1;
+	mlx5e_restore_tunnel(uplink_priv, skb, tunnel_id);
 
 	return 0;
 }

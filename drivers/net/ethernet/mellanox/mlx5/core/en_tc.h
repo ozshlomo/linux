@@ -92,11 +92,13 @@ void mlx5e_tc_reoffload_flows_work(struct work_struct *work);
 struct mlx5e_tc_flow *mlx5e_tc_get_flow(struct mlx5e_priv *priv,
 					int flags,
 					unsigned long cookie);
-extern int __rcu (*tc_skb_update_hook)(struct sk_buff *skb, u32 reg_c0);
+extern int __rcu (*tc_skb_update_hook)(struct sk_buff *skb, u32 reg_c0,
+				       u32 reg_c1);
 
 enum match_mapping_type {
 	mp_chain,
 	mp_tunnel_match,
+	mp_tunnel_miss,
 };
 
 struct match_mapping_params {
@@ -123,7 +125,8 @@ static inline int  mlx5e_tc_num_filters(struct mlx5e_priv *priv,
 	return 0;
 }
 static inline int  mlx5e_tc_num_filters(struct mlx5e_priv *priv, int flags) { return 0; }
-static int __rcu (*tc_skb_update_hook)(struct sk_buff *skb, u32 reg_c0) = NULL;
+static int __rcu (*tc_skb_update_hook)(struct sk_buff *skb, u32 reg_c0,
+				       u32 reg_c1) = NULL;
 #endif
 
 #endif /* __MLX5_EN_TC_H__ */

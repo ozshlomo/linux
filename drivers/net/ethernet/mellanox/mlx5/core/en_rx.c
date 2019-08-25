@@ -1026,7 +1026,7 @@ static inline void mlx5e_complete_rx_cqe(struct mlx5e_rq *rq,
 					 struct sk_buff *skb)
 {
 	struct mlx5e_rq_stats *stats = rq->stats;
-	int (*update_hook)(struct sk_buff *skb, u32 reg_c0);
+	int (*update_hook)(struct sk_buff *skb, u32 reg_c0, u32 reg_c1);
 
 	stats->packets++;
 	stats->bytes += cqe_bcnt;
@@ -1037,7 +1037,9 @@ static inline void mlx5e_complete_rx_cqe(struct mlx5e_rq *rq,
 	if (update_hook) {
 		u32 reg_c0 = (be32_to_cpu(cqe->sop_drop_qpn) &
 			      MLX5E_TC_FLOW_ID_MASK);
-		update_hook(skb, reg_c0);
+		u32 reg_c1 = be32_to_cpu(cqe->imm_inval_pkey);
+
+		update_hook(skb, reg_c0, reg_c1);
 	}
 	rcu_read_unlock();
 }
