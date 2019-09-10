@@ -2179,7 +2179,7 @@ static struct mlx5_fields fields[] = {
 	OFFLOAD(UDP_DPORT, 2, udp.dest,   0, udp_dport),
 };
 
-static int alloc_mod_hdr_actions(struct mlx5e_priv *priv,
+int alloc_mod_hdr_actions(struct mlx5e_priv *priv,
 				 int namespace,
 				 struct mlx5e_tc_flow_parse_attr *parse_attr);
 /* On success, attr->num_mod_hdr_actions says how many HW actions
@@ -2331,7 +2331,7 @@ static int mlx5e_flow_namespace_max_modify_action(struct mlx5_core_dev *mdev,
 		return MLX5_CAP_FLOWTABLE_NIC_RX(mdev, max_modify_header_actions);
 }
 
-static int alloc_mod_hdr_actions(struct mlx5e_priv *priv,
+int alloc_mod_hdr_actions(struct mlx5e_priv *priv,
 				 int namespace,
 				 struct mlx5e_tc_flow_parse_attr *parse_attr)
 {

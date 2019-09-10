@@ -407,6 +407,7 @@ struct mlx5_esw_flow_attr {
 	uint16_t zone;
 	uint32_t tunnel_id;
 	uint16_t ct_action;
+	struct flow_block *block;
 	struct mlx5e_tc_flow_parse_attr *parse_attr;
 };
 

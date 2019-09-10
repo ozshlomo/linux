@@ -10,6 +10,7 @@
 #include <net/netfilter/nf_conntrack_acct.h>
 
 #include <linux/workqueue.h>
+#include <linux/mlx5/device.h>
 
 #include "en/tc_ct.h"
 #include "en_rep.h"
@@ -43,21 +44,24 @@
 				## __VA_ARGS__);\
 	} while (0);
 
+#define ctflow_tuple(ct_flow)\
+	ct_flow->ce->ct->tuplehash[ct_flow->ce->dir].tuple
+
 #define printtuple(ct_flow, format, ...)\
 	pr_debug("%s %d %s @@ ct_flow: %px, tuple: (ethtype: %x) %d, IPs %pI4, %pI4 ports %d, %d @ flow: %px, zone: %d, entry: %px, flows: %d - " format "\n",\
-		__FILE__, __LINE__, __func__,\
-		ct_flow,\
-		(int) ntohs(ct_flow->tuple.src.l3num),\
-		ct_flow->tuple.dst.protonum,\
-		&ct_flow->tuple.src.u3.ip,\
-		&ct_flow->tuple.dst.u3.ip,\
-		ntohs(ct_flow->tuple.src.u.udp.port),\
-		ntohs(ct_flow->tuple.dst.u.udp.port),\
-		ct_flow->flow,\
-		ct_flow->zone_id,\
-		ct_flow->ce,\
-		ct_flow->ce->flows,\
-		## __VA_ARGS__);
+		 __FILE__, __LINE__, __func__,\
+			ct_flow,\
+			(int) ntohs(ctflow_tuple(ct_flow).src.l3num),\
+			ctflow_tuple(ct_flow).dst.protonum,\
+			&ctflow_tuple(ct_flow).src.u3.ip,\
+			&ctflow_tuple(ct_flow).dst.u3.ip,\
+			ntohs(ctflow_tuple(ct_flow).src.u.udp.port),\
+			ntohs(ctflow_tuple(ct_flow).dst.u.udp.port),\
+			ct_flow->flow,\
+			ct_flow->zone_id,\
+			ct_flow->ce,\
+			ct_flow->ce->flows,\
+## __VA_ARGS__);
 
 struct mlx5e_ct_control {
 	struct rhashtable work_ht;
@@ -94,12 +98,9 @@ struct ct_flow {
 	struct mlx5_flow_handle *rule;
 	struct mlx5_fc *counter;
 	struct hlist_node node;
-	struct nf_conntrack_tuple tuple;
 	u16 zone_id;
 	int mod_hdr_id;
 	int tuple_id;
-	struct nf_conn *ct;
-	enum ip_conntrack_dir dir;
 	u64 packets;
 	u64 bytes;
 	unsigned long lastuse;
@@ -110,12 +111,16 @@ struct ct_flow {
 };
 
 struct ct_entry {
-	struct nf_conn *ct;
-	struct list_head node;
 	struct list_head children;
+	struct list_head node;
 	unsigned long lastuse;
+	unsigned long cookie;
 	int flows;
 	u16 zone_id;
+
+	/* Debug: */
+	enum ip_conntrack_dir dir;
+	struct nf_conn *ct;
 };
 
 struct ct_work {
@@ -134,6 +139,7 @@ struct ct_work {
  * us a check for the IPS_OFFLOAD_BIT from the packet path via
  * nf_ct_is_expired().
  */
+/*
 static void nf_ct_offload_timeout(struct nf_conn *ct)
 {
 	if (nf_ct_expires(ct) < DAY / 2)
@@ -176,6 +182,7 @@ static void flow_offload_fixup_ct_state(struct nf_conn *ct, bool start)
 
 	ct->timeout = nfct_time_stamp + timeout;
 }
+*/
 
 void mlx5e_ct_update_pkts(struct mlx5_fc_cb *cb, u64 packets, u64 bytes)
 {
@@ -190,7 +197,6 @@ void mlx5e_ct_update_pkts(struct mlx5_fc_cb *cb, u64 packets, u64 bytes)
 	ct_flow->lastuse = jiffies;
 	if (ct_flow->ce->lastuse != ct_flow->lastuse)
 		ct_flow->ce->lastuse = max(ct_flow->ce->lastuse, ct_flow->lastuse);
-	nf_ct_offload_timeout(ct_flow->ct);
 
 	/* TODO: sync with priv->wq and fs_counters->wq,
 	 * as this counter is actually deleted after the ct_flow
@@ -199,90 +205,60 @@ void mlx5e_ct_update_pkts(struct mlx5_fc_cb *cb, u64 packets, u64 bytes)
 	 * before deletion of all related ct_flows */
 }
 
+int alloc_mod_hdr_actions(struct mlx5e_priv *priv,
+				 int namespace,
+				 struct mlx5e_tc_flow_parse_attr *parse_attr);
 static int ct_flow_build_modhdr_nat(struct mlx5e_ct_control *control,
 				    struct mlx5e_tc_flow *flow,
 				    struct ct_flow *ct_flow,
-				    struct nf_conn *ct,
-				    enum ip_conntrack_dir dir,
-				    struct nf_conntrack_tuple *tuple)
+				    struct flow_action *action)
 {
 	size_t action_size = MLX5_UN_SZ_BYTES(set_action_in_add_action_in_auto);
 	uint16_t ct_action = flow->esw_attr->ct_action;
 	struct mlx5e_tc_flow_parse_attr *parse_attr;
-	struct nf_conntrack_tuple target;
+	struct flow_action_entry *entry;
+	int i, err, field;
 	char *modact;
+	u32 offset;
 
 	if (!(ct_action & TCA_CT_ACT_NAT))
 		return 0;
 
 	parse_attr = ct_flow->esw_attr_ct.parse_attr;
-	modact = parse_attr->mod_hdr_actions +
-		 parse_attr->num_mod_hdr_actions * action_size;
 
-	nf_ct_invert_tuple(&target, &ct->tuplehash[!dir].tuple);
+	for (i = 0; i < action->num_entries; i++) {
+		entry = &action->entries[i];
+		offset = entry->mangle.offset;
 
-	/* SRC NAT:
-	 * orig  src=5.5.5.5 dst=5.5.5.6 sport=2001 dport=3002 (invert the other dir, target: src=5.5.5.7:8738, dst=5.5.5.6:3002)
-	 * reply src=5.5.5.6 dst=5.5.5.7 sport=3002 dport=8738 (invert the other dir, target: src=5.5.5.6:3002, dst=5.5.5.5:2001)
-	 */
+		printk(KERN_ERR "%s %d %s @@ i: %d id: %d, val: %d, ntohs: %d, ntohl: %d, offset: %d, htype: %d\n", __FILE__, __LINE__, __func__, i, entry->id,
+		       entry->mangle.val, entry->mangle.val, htons(entry->mangle.val), htonl(entry->mangle.offset), entry->mangle.htype);
 
-	if (memcmp(&target.src.u3, &tuple->src.u3, sizeof(target.src.u3))) {
-		printk(KERN_ERR "%s %d %s @@ ct: 5tuple: dir: %d, IPs %pI4, %pI4 ports %d, %d @ doing src nat to: [IPs %pI4, %pI4 ports %d, %d]\n",
-				__FILE__, __LINE__, __func__,
-				dir,
-				&tuple->src.u3.ip,
-				&tuple->dst.u3.ip,
-				ntohs(tuple->src.u.udp.port),
-				ntohs(tuple->dst.u.udp.port),
-				&target.src.u3.ip,
-				&target.dst.u3.ip,
-				ntohs(target.src.u.udp.port),
-				ntohs(target.dst.u.udp.port));
+		err = alloc_mod_hdr_actions(flow->priv, MLX5_FLOW_NAMESPACE_FDB, parse_attr);
+		if (err)
+			return err;
 
-		/* Need to change src to target src */
+		modact = parse_attr->mod_hdr_actions +
+			parse_attr->num_mod_hdr_actions * action_size;
 		MLX5_SET(set_action_in, modact, action_type, MLX5_ACTION_TYPE_SET);
-		MLX5_SET(set_action_in, modact, field, MLX5_ACTION_IN_FIELD_OUT_SIPV4);
 		MLX5_SET(set_action_in, modact, offset, 0);
-		MLX5_SET(set_action_in, modact, length, 32);
-		MLX5_SET(set_action_in, modact, data, htonl(target.src.u3.ip));
-		modact += action_size;
-		parse_attr->num_mod_hdr_actions++;
-
-		MLX5_SET(set_action_in, modact, action_type, MLX5_ACTION_TYPE_SET);
-		MLX5_SET(set_action_in, modact, field, MLX5_ACTION_IN_FIELD_OUT_TCP_SPORT);
-		MLX5_SET(set_action_in, modact, offset, 0);
-		MLX5_SET(set_action_in, modact, length, 16);
-		MLX5_SET(set_action_in, modact, data, htons(target.src.u.tcp.port));
-		modact += action_size;
-		parse_attr->num_mod_hdr_actions++;
-	} else if (memcmp(&target.dst.u3, &tuple->dst.u3, sizeof(target.dst.u3))) {
-		printk(KERN_ERR "%s %d %s @@ ct: 5tuple: dir: %d, IPs %pI4, %pI4 ports %d, %d @ doing dst nat to: [IPs %pI4, %pI4 ports %d, %d]\n",
-				__FILE__, __LINE__, __func__,
-				dir,
-				&tuple->src.u3.ip,
-				&tuple->dst.u3.ip,
-				ntohs(tuple->src.u.udp.port),
-				ntohs(tuple->dst.u.udp.port),
-				&target.src.u3.ip,
-				&target.dst.u3.ip,
-				ntohs(target.src.u.udp.port),
-				ntohs(target.dst.u.udp.port));
-
-		MLX5_SET(set_action_in, modact, action_type, MLX5_ACTION_TYPE_SET);
-		MLX5_SET(set_action_in, modact, field, MLX5_ACTION_IN_FIELD_OUT_DIPV4);
-		MLX5_SET(set_action_in, modact, offset, 0);
-		MLX5_SET(set_action_in, modact, length, 32);
-		MLX5_SET(set_action_in, modact, data, htonl(target.dst.u3.ip));
-		modact += action_size;
-		parse_attr->num_mod_hdr_actions++;
-
-		MLX5_SET(set_action_in, modact, action_type, MLX5_ACTION_TYPE_SET);
-		MLX5_SET(set_action_in, modact, field, MLX5_ACTION_IN_FIELD_OUT_TCP_DPORT);
-		MLX5_SET(set_action_in, modact, offset, 0);
-		MLX5_SET(set_action_in, modact, length, 16);
-		MLX5_SET(set_action_in, modact, data, htons(target.dst.u.tcp.port));
-		modact += action_size;
-		parse_attr->num_mod_hdr_actions++;
+		MLX5_SET(set_action_in, modact, data, entry->mangle.val);
+		switch (entry->mangle.htype) {
+			case FLOW_ACT_MANGLE_HDR_TYPE_IP4:
+				MLX5_SET(set_action_in, modact, length, 0);
+				field = (offset == offsetof(struct iphdr, saddr)) ?
+					 MLX5_ACTION_IN_FIELD_OUT_SIPV4 :
+					 MLX5_ACTION_IN_FIELD_OUT_DIPV4;
+				break;
+			case FLOW_ACT_MANGLE_HDR_TYPE_TCP:
+				MLX5_SET(set_action_in, modact, length, 16);
+				field = (offset == offsetof(struct iphdr, saddr)) ?
+					 MLX5_ACTION_IN_FIELD_OUT_TCP_SPORT :
+					 MLX5_ACTION_IN_FIELD_OUT_TCP_DPORT;
+				break;
+			default:
+				return -EOPNOTSUPP;
+		}
+		MLX5_SET(set_action_in, modact, field, field);
 	}
 
 	return 0;
@@ -291,15 +267,13 @@ static int ct_flow_build_modhdr_nat(struct mlx5e_ct_control *control,
 static int ct_flow_build_modhdr(struct mlx5e_ct_control *control,
 				struct mlx5e_tc_flow *flow,
 				struct ct_flow *ct_flow,
-				struct nf_conn *ct,
+				struct flow_rule *rule,
 				uint16_t tupleid,
-				enum ip_conntrack_dir dir,
-				struct nf_conntrack_tuple *tuple,
 				int *mod_hdr_id)
 {
 	struct mlx5e_tc_flow_parse_attr *parse_attr;
+	struct flow_action *action = &rule->action;
 	struct mlx5e_priv *priv = flow->priv;
-	struct nf_conn_labels *cl;
 	int num_actions, err;
 	char *actions;
 
@@ -307,26 +281,22 @@ static int ct_flow_build_modhdr(struct mlx5e_ct_control *control,
 				       tupleid, 0, true);
 	if (err)
 		return  err;
+
 	err = get_direct_match_mapping(priv, &ct_flow->esw_attr_ct, mp_statezone,
-				       0xFFFF0000 | ct->zone.id, 0, true);
+				       0xFFFF0000 | action->entries[0].ct_metadata.zone, 0, true);
 	if (err)
 		return  err;
 	err = get_direct_match_mapping(priv, &ct_flow->esw_attr_ct, mp_mark,
-				       ct->mark, 0, true);
+				       action->entries[0].ct_metadata.mark, 0, true);
 	if (err)
 		return  err;
 
-	cl = nf_ct_labels_find(ct);
-	if (cl) {
-		uint32_t ct_labels[4];
+	err = get_direct_match_mapping(priv, &ct_flow->esw_attr_ct,
+			mp_labels, action->entries[0].ct_metadata.labels[0], 0, true);
+	if (err)
+		return err;
 
-		err = get_direct_match_mapping(priv, &ct_flow->esw_attr_ct,
-					       mp_labels, ct_labels[0], 0, true);
-		if (err)
-			return err;
-	}
-
-	err = ct_flow_build_modhdr_nat(control, flow, ct_flow, ct, dir, tuple);
+	err = ct_flow_build_modhdr_nat(control, flow, ct_flow, action);
 	if (err)
 		return err;
 
@@ -341,6 +311,7 @@ static int ct_flow_build_modhdr(struct mlx5e_ct_control *control,
 		printk(KERN_ERR "%s %d %s @@ ERR mod hdr: %d\n", __FILE__, __LINE__, __func__, err);
 		return err;
 	}
+	printk(KERN_ERR "%s %d %s @@ ct_flow: %px, mod_hdr: %d\n", __FILE__, __LINE__, __func__, ct_flow, mod_hdr_id);
 
 	ct_flow->esw_attr_ct.action |= MLX5_FLOW_CONTEXT_ACTION_MOD_HDR;
 	ct_flow->esw_attr_ct.mod_hdr_id = *mod_hdr_id;
@@ -387,10 +358,16 @@ static bool ct_more_restricting_match(unsigned char *old_mask,
 
 static int ct_flow_add_tuple_match(struct mlx5e_tc_flow *flow,
 				   struct ct_flow *ct_flow,
-				   struct nf_conntrack_tuple *tuple)
+				   struct flow_rule *rule)
 {
 	struct mlx5_flow_spec *spec = &ct_flow->esw_attr_ct.parse_attr->spec;
+	u32 flags, flags_m, wanted, wanted_m;
+	struct flow_match_control control;
+	struct flow_match_basic basic;
+	struct flow_match_ports tps;
 	void *headers_c, *headers_v;
+	u16 addr_type = 0;
+	u8 ip_proto = 0;
 
 	if (flow_flag_test(flow, EGRESS) && !flow->esw_attr->chain) {
 		headers_c = MLX5_ADDR_OF(fte_match_param, spec->match_criteria,
@@ -406,42 +383,62 @@ static int ct_flow_add_tuple_match(struct mlx5e_tc_flow *flow,
 		ct_flow->esw_attr_ct.outer_match_level = MLX5_MATCH_L4;
 	}
 
-	if (tuple->src.l3num == NFPROTO_IPV4) {
-		if (!TUPLE_SET_MATCH(ethertype, cpu_to_be16(ETH_P_IP)))
-			return -EOPNOTSUPP;
-		if (!TUPLE_SET_MATCH(src_ipv4_src_ipv6.ipv4_layout.ipv4, tuple->src.u3.ip))
-			return -EOPNOTSUPP;
-		if (!TUPLE_SET_MATCH(dst_ipv4_dst_ipv6.ipv4_layout.ipv4, tuple->dst.u3.ip))
-			return -EOPNOTSUPP;
-		if (!TUPLE_SET_MATCH(ip_protocol, tuple->dst.protonum))
-			return -EOPNOTSUPP;
-	} else if (tuple->src.l3num == NFPROTO_IPV6) {
-		if (!TUPLE_SET_MATCH(ethertype, cpu_to_be16(ETH_P_IPV6)))
-			return -EOPNOTSUPP;
-		if (!TUPLE_SET_MATCH_PTR(src_ipv4_src_ipv6.ipv6_layout.ipv6, tuple->src.u3.ip6))
-			return -EOPNOTSUPP;
-		if (!TUPLE_SET_MATCH_PTR(dst_ipv4_dst_ipv6.ipv6_layout.ipv6, tuple->dst.u3.ip6))
-			return -EOPNOTSUPP;
-	} else {
-		return -EOPNOTSUPP;
+	flow_rule_match_control(rule, &control);
+	flow_rule_match_basic(rule, &basic);
+	flow_rule_match_ports(rule, &tps);
+
+	ip_proto = basic.key->ip_proto;
+	addr_type = control.key->addr_type;
+
+	MLX5_SET(fte_match_set_lyr_2_4, headers_v, ethertype,
+		 ntohs(basic.key->n_proto));
+	MLX5_SET(fte_match_set_lyr_2_4, headers_v, ip_protocol,
+		 basic.key->ip_proto);
+	MLX5_SET_TO_ONES(fte_match_set_lyr_2_4, headers_c, ethertype);
+	MLX5_SET_TO_ONES(fte_match_set_lyr_2_4, headers_c, ip_protocol);
+
+	if (addr_type == FLOW_DISSECTOR_KEY_IPV4_ADDRS) {
+		struct flow_match_ipv4_addrs match;
+
+		flow_rule_match_ipv4_addrs(rule, &match);
+		memcpy(MLX5_ADDR_OF(fte_match_set_lyr_2_4, headers_v,
+				    src_ipv4_src_ipv6.ipv4_layout.ipv4),
+		       &match.key->src, sizeof(match.key->src));
+		memcpy(MLX5_ADDR_OF(fte_match_set_lyr_2_4, headers_v,
+				    dst_ipv4_dst_ipv6.ipv4_layout.ipv4),
+		       &match.key->dst, sizeof(match.key->dst));
+		MLX5_SET_TO_ONES(fte_match_set_lyr_2_4, headers_c,
+				 dst_ipv4_dst_ipv6.ipv4_layout.ipv4);
+		MLX5_SET_TO_ONES(fte_match_set_lyr_2_4, headers_c,
+				 src_ipv4_src_ipv6.ipv4_layout.ipv4);
+	} else if (addr_type == FLOW_DISSECTOR_KEY_IPV6_ADDRS) {
+		struct flow_match_ipv6_addrs match;
+
+		flow_rule_match_ipv6_addrs(rule, &match);
+
+		memcpy(MLX5_ADDR_OF(fte_match_set_lyr_2_4, headers_v,
+				    src_ipv4_src_ipv6.ipv6_layout.ipv6),
+		       &match.key->src, sizeof(match.key->src));
+		memcpy(MLX5_ADDR_OF(fte_match_set_lyr_2_4, headers_v,
+				    dst_ipv4_dst_ipv6.ipv6_layout.ipv6),
+		       &match.key->dst, sizeof(match.key->dst));
+		memset(MLX5_ADDR_OF(fte_match_set_lyr_2_4, headers_c,
+				    src_ipv4_src_ipv6.ipv6_layout.ipv6),
+		       0, sizeof(match.key->src));
+		memset(MLX5_ADDR_OF(fte_match_set_lyr_2_4, headers_c,
+				    dst_ipv4_dst_ipv6.ipv6_layout.ipv6),
+		       0, sizeof(match.key->dst));
 	}
 
-	if (!TUPLE_SET_MATCH(ip_protocol, tuple->dst.protonum))
-		return -EOPNOTSUPP;
-	switch (tuple->dst.protonum) {
-	case IPPROTO_UDP:
-		if (!TUPLE_SET_MATCH(udp_sport, tuple->src.u.udp.port))
-			return -EOPNOTSUPP;
-		if (!TUPLE_SET_MATCH(udp_dport, tuple->dst.u.udp.port))
-			return -EOPNOTSUPP;
-	break;
-	case IPPROTO_TCP: {
-		u32 flags, flags_m, wanted, wanted_m;
+	switch (ip_proto) {
+	case IPPROTO_TCP:
+		MLX5_SET(fte_match_set_lyr_2_4, headers_v,
+			 tcp_sport, ntohs(tps.key->src));
 
-		if (!TUPLE_SET_MATCH(tcp_sport, tuple->src.u.tcp.port))
-			return -EOPNOTSUPP;
-		if (!TUPLE_SET_MATCH(tcp_dport, tuple->dst.u.tcp.port))
-			return -EOPNOTSUPP;
+		MLX5_SET(fte_match_set_lyr_2_4, headers_v,
+			 tcp_dport, ntohs(tps.key->dst));
+		MLX5_SET_TO_ONES(fte_match_set_lyr_2_4, headers_c, tcp_dport);
+		MLX5_SET_TO_ONES(fte_match_set_lyr_2_4, headers_c, tcp_sport);
 
 		flags = MLX5_GET(fte_match_set_lyr_2_4, headers_c, tcp_flags);
 		flags_m = MLX5_GET(fte_match_set_lyr_2_4, headers_v, tcp_flags);
@@ -455,8 +452,16 @@ static int ct_flow_add_tuple_match(struct mlx5e_tc_flow *flow,
 
 		MLX5_SET(fte_match_set_lyr_2_4, headers_c, tcp_flags, wanted_m);
 		MLX5_SET(fte_match_set_lyr_2_4, headers_v, tcp_flags, wanted);
-	}
-	break;
+		break;
+
+	case IPPROTO_UDP:
+		MLX5_SET(fte_match_set_lyr_2_4, headers_v,
+			 udp_sport, ntohs(tps.key->src));
+		MLX5_SET(fte_match_set_lyr_2_4, headers_v,
+			 udp_dport, ntohs(tps.key->dst));
+		MLX5_SET_TO_ONES(fte_match_set_lyr_2_4, headers_c, udp_sport);
+		MLX5_SET_TO_ONES(fte_match_set_lyr_2_4, headers_c, udp_dport);
+		break;
 	default:
 		return -EOPNOTSUPP;
 	}
@@ -466,47 +471,44 @@ static int ct_flow_add_tuple_match(struct mlx5e_tc_flow *flow,
 
 static int ct_flow_insert(struct mlx5e_ct_control *control,
 			  struct ct_entry *entry,
-			  struct mlx5e_tc_flow *flow,
-			  enum ip_conntrack_dir dir)
+			  struct flow_rule *rule,
+			  struct mlx5e_tc_flow *flow)
 {
 	struct mlx5e_tc_flow_parse_attr parse_attr;
-	struct nf_conntrack_tuple *tuple;
 	struct ct_flow *ct_flow = NULL;
-	struct nf_conn *ct = entry->ct;
 	struct mlx5_fc *counter = NULL;
-	struct mlx5_flow_handle *rule;
 	u16 zone_id = entry->zone_id;
 	struct mlx5_flow_spec *spec;
 	int mod_hdr_id, index = 0;
 	int err = 0;
 
-	tuple = &ct->tuplehash[dir].tuple;
 	ct_flow = kzalloc(sizeof(*ct_flow), GFP_KERNEL);
 	if (!ct_flow) {
 		return -ENOMEM;
 	}
+	ct_flow->ce = entry;
 
 	/* Base ct flow on original flow */
 	memcpy(&ct_flow->esw_attr_ct, flow->esw_attr, sizeof(struct mlx5_esw_flow_attr));
 	memcpy(&parse_attr, flow->esw_attr->parse_attr, sizeof(parse_attr));
 	ct_flow->esw_attr_ct.parse_attr = &parse_attr;
 	spec = &parse_attr.spec;
-	err = ct_flow_add_tuple_match(flow, ct_flow, tuple);
+	err = ct_flow_add_tuple_match(flow, ct_flow, rule);
 	if (err)
 		goto err_tuple;
 
 	/* Get tuple unique id */
 	index = 0x1AAA;
 	/* TODO: IF WE FAIL HERE, SEEM TO BE A BUG WITH some CONNECTIONS remain
-	 * established, 
+	 * established,
 	 * CHANGE THE index to something close to MAX_TUPLE_ID  */
 	err = idr_alloc_u32(&control->tuple_ids, ct_flow, &index, MAX_TUPLE_ID,
 			    GFP_KERNEL);
 	if (err)
 		goto err_idr;
 
-	err = ct_flow_build_modhdr(control, flow, ct_flow, ct, index, dir,
-				   tuple, &mod_hdr_id);
+	err = ct_flow_build_modhdr(control, flow, ct_flow, rule, index,
+				   &mod_hdr_id);
 	if (err)
 		goto err_modhdr;
 
@@ -518,40 +520,29 @@ static int ct_flow_insert(struct mlx5e_ct_control *control,
 	}
 	ct_flow->esw_attr_ct.counter = counter;
 
-	rule = mlx5_eswitch_add_offloaded_rule(control->esw, spec,
-					       &ct_flow->esw_attr_ct);
-	if (IS_ERR(rule)) {
-		err = PTR_ERR(rule);
+	ct_flow->rule = mlx5_eswitch_add_offloaded_rule(control->esw, spec,
+					                &ct_flow->esw_attr_ct);
+	if (IS_ERR(ct_flow->rule)) {
+		err = PTR_ERR(ct_flow->rule);
 		printk(KERN_ERR "%s %d %s @@ ERR add: %d\n", __FILE__, __LINE__, __func__, err);
 		goto err_rule;
 	}
 
-	ct_flow->rule = rule;
 	ct_flow->flow = flow;
 	ct_flow->counter = counter;
 	ct_flow->mod_hdr_id = mod_hdr_id;
 	ct_flow->tuple_id = index;
-	ct_flow->ct = ct;
-	nf_conntrack_get(&ct->ct_general);
-	ct_flow->dir = dir;
 	ct_flow->zone_id = zone_id;
 	ct_flow->lastuse = jiffies;
-	memcpy(&ct_flow->tuple, tuple, sizeof(ct_flow->tuple));
-	ct_flow->ce = entry;
 	list_add(&ct_flow->entry, &entry->children);
+
+	entry->flows++;
+	printtuple(ct_flow, "offloaded");
 
 	/* TODO: rule was already in idr so after we offloaded the above,
 	 * we can find it. we just won't delete it on del since it's not in
 	 * the hash till the next line */
 	hash_add(control->tuple_tbl, &ct_flow->node, (u32) flow->cookie);
-
-	if (entry->flows++ == 0) {
-		set_bit(IPS_OFFLOAD_BIT, &ct->status);
-		flow_offload_fixup_ct_state(ct, true);
-		nf_ct_offload_timeout(ct);
-	}
-
-	printtuple(ct_flow, "offloaded");
 
 	ct_flow->cb.updated = mlx5e_ct_update_pkts;
 	mlx5_fc_register_set_cb(counter, &ct_flow->cb);
@@ -576,7 +567,9 @@ static bool ct_flow_delete(struct mlx5e_ct_control *control,
 	struct mlx5_eswitch *esw = control->esw;
 	struct ct_entry *entry = ct_flow->ce;
 
+
 	printtuple(ct_flow, "delete");
+
 	hash_del(&ct_flow->node);
 
 	list_del(&ct_flow->entry);
@@ -586,16 +579,11 @@ static bool ct_flow_delete(struct mlx5e_ct_control *control,
 	idr_remove(&control->tuple_ids, ct_flow->tuple_id);
 	mlx5_fc_destroy(ct_flow->esw_attr_ct.counter_dev, ct_flow->esw_attr_ct.counter);
 
-	nf_conntrack_put(&ct_flow->ct->ct_general);
 	kfree(ct_flow);
 
 	if (--entry->flows == 0) {
 		list_del(&entry->node);
 
-		clear_bit(IPS_OFFLOAD_BIT, &entry->ct->status);
-		flow_offload_fixup_ct_state(entry->ct, false);
-
-		nf_conntrack_put(&entry->ct->ct_general);
 		kfree(entry);
 		return true;
 	}
@@ -638,189 +626,156 @@ static void mlx5e_ct_aging(struct work_struct *work)
 			   msecs_to_jiffies(CT_FLOW_AGING_STEP * 1000));
 }
 
-static const struct rhashtable_params work_params = {
-	.head_offset = offsetof(struct ct_work, node),
-	.key_offset = offsetof(struct ct_work, ct),
-	.key_len = sizeof(((struct ct_work *)0)->ct) + sizeof(bool),
-	.automatic_shrinking = true,
-};
-
-static void mlx5e_configure_ct_work(struct work_struct *works)
+int mlx5e_configure_ct(struct net_device *dev, struct mlx5e_priv *priv,
+		       struct flow_cls_offload *f, int flags)
 {
-	struct ct_work *work = container_of(works, struct ct_work, work);
-	struct mlx5e_ct_control *control = get_control(work->priv);
-	struct nf_conn *ct = work->ct;
+	return -EOPNOTSUPP;
+}
+
+static int mlx5e_ct_block_flow_offload_add(struct mlx5e_ct_control *control,
+					   struct ct_flow_offload *ct_flow)
+{
+	struct flow_rule *rule = &ct_flow->rule;
+	unsigned long cookie = ct_flow->cookie;
+	struct ct_flow_table *ft = ct_flow->ft;
 	struct mlx5e_tc_flow *flow;
-	struct hlist_node *tmp;
 	struct ct_entry *entry;
+	struct hlist_node *tmp;
 	u32 hash_key;
-
-	rtnl_lock();
-
-	if (work->del) {
-		if (!test_bit(IPS_OFFLOAD_BIT, &ct->status))
-			goto out;
-
-		list_for_each_entry(entry, &control->cts, node) {
-			if (entry->ct == ct) {
-				ct_entry_delete(control, entry);
-				break;
-			}
-		}
-
-		goto out;
-	}
-
-	if (test_bit(IPS_OFFLOAD_BIT, &ct->status))
-		goto out;
 
 	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
 	if (!entry)
-		goto out;
+		return -ENOMEM;
 
 	INIT_LIST_HEAD(&entry->children);
-	nf_conntrack_get(&ct->ct_general);
-	entry->ct = ct;
-	entry->zone_id = nf_ct_zone(ct)->id;
+	entry->zone_id = ft->zone;
 	entry->lastuse = jiffies;
+	entry->cookie = cookie;
+	entry->ct = ct_flow->ct;
+	entry->dir = ct_flow->dir;
 
 	hash_key = (u32) entry->zone_id;
 	hash_for_each_possible_safe(control->ct_flows, flow, tmp,
 				    ct_node, hash_key) {
-		printct(ct, "flow->esw_attr->zone: %d", flow->esw_attr->zone);
-		if (entry->zone_id == flow->esw_attr->zone) {
-			ct_flow_insert(control, entry, flow, IP_CT_DIR_ORIGINAL);
-			ct_flow_insert(control, entry, flow, IP_CT_DIR_REPLY);
-		}
-	}
-
-	if (!entry->flows) {
-		printct(ct, "no flows offloaded");
-		goto out_free;
+		printct(entry->ct, "flow->esw_attr->zone: %d", flow->esw_attr->zone);
+		if (entry->zone_id == flow->esw_attr->zone)
+			ct_flow_insert(control, entry, rule, flow);
 	}
 
 	list_add(&entry->node, &control->cts);
 
-	goto out;
-
-out_free:
-	nf_conntrack_put(&entry->ct->ct_general);
-	kfree(entry);
-
-out:
-	rtnl_unlock();
-	nf_conntrack_put(&ct->ct_general);
-	rhashtable_remove_fast(&control->work_ht, &work->node, work_params);
+	return 0;
 }
 
-struct sel_type {
-	struct flow_cls_offload cls_flower;
-	struct sk_buff *skb;
-};
-
-int _mlx5e_configure_ct(struct mlx5e_ct_control *control,
-			struct mlx5e_priv *priv,
-		        struct flow_cls_offload *f,
-			int flags)
+static int mlx5e_ct_block_flow_offload_del(struct mlx5e_ct_control *control,
+					   struct ct_flow_offload *ct_flow)
 {
-	struct sel_type *sel = container_of(f, struct sel_type, cls_flower);
-	struct sk_buff *skb = sel->skb;
-	enum ip_conntrack_info ctinfo;
-	struct ct_work *work = NULL;
-	struct nf_conn *ct;
-	u_int16_t family;
-	bool del = false;
+	unsigned long cookie = ct_flow->cookie;
+	struct ct_entry *entry;
 
-	ct = nf_ct_get(skb, &ctinfo);
-	if (!ct)
-		return 0;
-
-	printct(ct, "ctinfo: %d", ctinfo);
-	if (ctinfo != IP_CT_ESTABLISHED_REPLY && ctinfo != IP_CT_ESTABLISHED)
-		return 0;
-
-	family = nf_ct_l3num(ct);
-	if (family != NFPROTO_IPV4 && family != NFPROTO_IPV6)
-		return 0;
-
-	switch (nf_ct_protonum(ct)) {
-	case IPPROTO_TCP:
-		if (ct->proto.tcp.state < TCP_CONNTRACK_ESTABLISHED)
+	list_for_each_entry(entry, &control->cts, node) {
+		if (entry->cookie == cookie) {
+			ct_entry_delete(control, entry);
 			return 0;
-		if (ct->proto.tcp.state > TCP_CONNTRACK_ESTABLISHED)
-			del = true;
-		break;
-	case IPPROTO_UDP:
-		break;
-		/* TODO: udp fix end of connection or should we just rely on aging
-		 * for both? */
-	default:
-		return 0;
+		}
+	}
+
+	return -ENOENT;
+}
+
+static int mlx5e_ct_block_flow_offload_stats(struct mlx5e_ct_control *control,
+					     struct ct_flow_offload *ct_flow)
+{
+	struct flow_stats *stats = &ct_flow->stats;
+	unsigned long cookie = ct_flow->cookie;
+	struct ct_entry *entry;
+	u64 lastused;
+
+	list_for_each_entry(entry, &control->cts, node) {
+		if (entry->cookie == cookie) {
+			lastused = entry->lastuse;
+
+			flow_stats_update(stats, 0, 0, lastused);
+			return 0;
+		}
+	}
+
+	return -ENOENT;
+}
+
+static int mlx5e_ct_block_flow_offload(enum tc_setup_type type, void *type_data,
+				       void *cb_priv)
+{
+	struct mlx5e_ct_control *control = cb_priv;
+	struct ct_flow_offload *ct_flow = type_data;
+	struct ct_flow_table *ft = ct_flow->ft;
+	unsigned long cookie = ct_flow->cookie;
+
+	switch (ct_flow->command) {
+		case CT_FLOW_ADD:
+			printk(KERN_ERR "%s %d %s @@ ft: %px, ADD, cookie: %lu\n", __FILE__, __LINE__, __func__, ft, cookie);
+			return mlx5e_ct_block_flow_offload_add(control, ct_flow);
+			break;
+		case CT_FLOW_DEL:
+			printk(KERN_ERR "%s %d %s @@ ft: %px, DEL, cookie: %lu\n", __FILE__, __LINE__, __func__, ft, cookie);
+			return mlx5e_ct_block_flow_offload_del(control, ct_flow);
+		case CT_FLOW_STATS:
+			printk(KERN_ERR "%s %d %s @@ ft: %px, STATS, cookie: %lu\n", __FILE__, __LINE__, __func__, ft, cookie);
+			return mlx5e_ct_block_flow_offload_stats(control, ct_flow);
+		default:
+			break;
 	};
 
-	work = kzalloc(sizeof(*work), GFP_ATOMIC);
-	if (!work) {
-		WARN_ON_ONCE(1);
-		return 0;
-	}
-
-	INIT_WORK(&work->work, mlx5e_configure_ct_work);
-	work->priv = priv;
-	work->ct = ct;
-	work->del = del;
-
-	if (rhashtable_lookup_insert_fast(&control->work_ht, &work->node,
-					  work_params)) {
-		goto err_exists;
-	}
-
-	nf_conntrack_get(&ct->ct_general);
-	if (!queue_work(control->wq, &work->work))
-		goto err_queue;
-
-	return 0;
-
-err_queue:
-	nf_conntrack_put(&ct->ct_general);
-	rhashtable_remove_fast(&control->work_ht, &work->node, work_params);
-err_exists:
-	kfree(work);
-	return 0;
-}
-
-int mlx5e_configure_ct(struct net_device *dev, struct mlx5e_priv *priv,
-		       struct flow_cls_offload *f, int flags)
-{
-	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
-	struct mlx5_rep_uplink_priv *uplink_priv;
-	struct mlx5e_rep_priv *uplink_rpriv;
-	struct mlx5e_ct_control *control;
-
-
-	uplink_rpriv = mlx5_eswitch_get_uplink_priv(esw, REP_ETH);
-	uplink_priv = &uplink_rpriv->uplink_priv;
-	control = uplink_priv->ct_control;
-	if (!control)
-		return -EOPNOTSUPP;
-
-	return _mlx5e_configure_ct(control, priv, f, flags);
+	return -EOPNOTSUPP;
 }
 
 int mlx5e_ct_flow_offload(struct mlx5e_tc_flow *flow)
 {
 	struct mlx5e_ct_control *control = get_control(flow->priv);
 	struct mlx5_esw_flow_attr *attr = flow->esw_attr;
-	struct ct_entry *entry;
 
 	if (!mlx5_eswitch_vport_match_metadata_enabled(control->esw))
 		return -EOPNOTSUPP;
 
-	list_for_each_entry(entry, &control->cts, node) {
-		if (entry->zone_id == attr->zone) {
-			ct_flow_insert(control, entry, flow, IP_CT_DIR_ORIGINAL);
-			ct_flow_insert(control, entry, flow, IP_CT_DIR_REPLY);
+	if (attr->block) {
+		struct flow_block *block = attr->block;
+		struct flow_block_cb *block_cb;
+		bool found = false;
+		int err;
+
+		printk(KERN_ERR "%s %d %s @@ block: %px\n", __FILE__, __LINE__, __func__, block);
+		list_for_each_entry(block_cb, &block->cb_list, list) {
+			printk(KERN_ERR "%s %d %s @@ block: %px, has control? %px\n", __FILE__, __LINE__, __func__, block, control);
+			if (block_cb->cb_ident == control) {
+				printk(KERN_ERR "%s %d %s @@ block: %px, has control? %px: yes\n", __FILE__, __LINE__, __func__, block, control);
+				found = true;
+				break;
+			}
+		}
+
+		if (!found) {
+			printk(KERN_ERR "%s %d %s @@ block: %px, adding cb: %px, with ident/priv: %px\n", __FILE__, __LINE__, __func__, block, mlx5e_ct_block_flow_offload, control);
+			block_cb = flow_block_cb_alloc(mlx5e_ct_block_flow_offload, control, control, NULL);
+			if (IS_ERR(block_cb)) {
+				err = PTR_ERR(block_cb);
+				printk(KERN_ERR "%s %d %s @@ failed alloc block %d\n", __FILE__, __LINE__, __func__, err);
+				return err;
+			}
+
+			list_add_tail(&block_cb->list, &block->cb_list);
+			printk(KERN_ERR "%s %d %s @@ Binded to block: %px\n", __FILE__, __LINE__, __func__, block);
 		}
 	}
+
+	/*
+	 * TODO reply offload
+	list_for_each_entry(entry, &control->cts, node) {
+		if (entry->zone_id == attr->zone) {
+			ct_flow_...(control, entry, flow, IP_CT_DIR_ORIGINAL);
+			ct_flow_(control, entry, flow, IP_CT_DIR_REPLY);
+		}
+	}
+	*/
 
 	hash_add(control->ct_flows, &flow->ct_node, (u32) attr->zone);
 
@@ -940,6 +895,7 @@ int mlx5e_ct_parse_action(struct mlx5e_tc_flow *flow,
 
 	attr->zone = act->ct.zone;
 	attr->ct_action = act->ct.action;
+	attr->block = act->ct.block;
 
 	return 0;
 }
@@ -970,7 +926,6 @@ int mlx5e_ct_init(struct mlx5_rep_uplink_priv *uplink_priv)
 	control->mdev = npriv->mdev;
 	control->esw = npriv->mdev->priv.eswitch;
 	control->wq = npriv->wq;
-	rhashtable_init(&control->work_ht, &work_params);
 
 	INIT_DELAYED_WORK(&control->aging, mlx5e_ct_aging);
 	if (!queue_delayed_work(control->wq, &control->aging,
@@ -1018,10 +973,12 @@ int mlx5e_ct_restore_flow(struct mlx5_rep_uplink_priv *uplink_priv,
 		return 0;
 	}
 
+	/*
 	nf_conntrack_get(&ct_flow->ct->ct_general);
 	nf_ct_set(skb, ct_flow->ct, ct_flow->dir == IP_CT_DIR_ORIGINAL ?
 				    IP_CT_ESTABLISHED :
 				    IP_CT_ESTABLISHED_REPLY);
+	*/
 
 	//printk(KERN_ERR "%s %d %s @@ restored tuple id: %d, skb: %px, ct_flow: %px,  px: %px, tunnel_id: %d\n", __FILE__, __LINE__, __func__, tupleid, skb, ct_flow, ct_flow->ct, ct_flow->esw_attr_ct.tunnel_id);
 	*tunnel_id = ct_flow->esw_attr_ct.tunnel_id;
