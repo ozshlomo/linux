@@ -124,7 +124,6 @@ static const struct rhashtable_params match_params = {
 
 struct ct_flow_table_entry {
 	struct ct_flow_table_match match[IP_CT_DIR_MAX];
-	struct flow_dissector dissector;
 	struct ct_flow_table *ft;
 	struct nf_conn *ct;
 	u64 lastused;
@@ -281,6 +280,7 @@ static int tcf_ct_build_flow_action(struct flow_action *action,
 static int tcf_ct_notify_cmd_add(struct ct_flow_table *ft,
 				 struct ct_flow_table_entry *entry)
 {
+	struct flow_dissector dissector = {};
 	struct ct_flow_offload ct_flow = {};
 	struct flow_action *action;
 	struct flow_match *match;
@@ -292,7 +292,17 @@ static int tcf_ct_notify_cmd_add(struct ct_flow_table *ft,
 	ct_flow.ft = ft;
 
 	match = &ct_flow.rule.match;
-	match->dissector = &entry->dissector;
+
+#define SET_RULE_DISSECTOR(dissector, keyid, key_member) \
+	dissector.used_keys |= (1 << keyid); \
+	dissector.offset[keyid] = offsetof(struct ct_flow_table_match_key, \
+						  key_member);
+	SET_RULE_DISSECTOR(dissector, FLOW_DISSECTOR_KEY_CONTROL, control);
+	SET_RULE_DISSECTOR(dissector, FLOW_DISSECTOR_KEY_BASIC, basic);
+	SET_RULE_DISSECTOR(dissector, FLOW_DISSECTOR_KEY_PORTS, tp);
+	SET_RULE_DISSECTOR(dissector, FLOW_DISSECTOR_KEY_IPV4_ADDRS, ipv4);
+
+	match->dissector = &dissector;
 	action = &ct_flow.rule.action;
 
 	ct_flow.dir = IP_CT_DIR_ORIGINAL;
@@ -488,15 +498,6 @@ static int tcf_ct_flow_add(struct ct_flow_table *ft, struct nf_conn *ct)
 	flow_offload_fixup_ct_state(ct, true);
 
 	printk(KERN_ERR "%s %d %s @@ ft: %px entry: %px, ct: %px\n", __FILE__, __LINE__, __func__, ft, entry, entry->ct);
-
-#define SET_RULE_DISSECTOR(entry, keyid, key_member) \
-	entry->dissector.used_keys |= (1 << keyid); \
-	entry->dissector.offset[keyid] = offsetof(struct ct_flow_table_match_key, \
-						  key_member);
-	SET_RULE_DISSECTOR(entry, FLOW_DISSECTOR_KEY_CONTROL, control);
-	SET_RULE_DISSECTOR(entry, FLOW_DISSECTOR_KEY_BASIC, basic);
-	SET_RULE_DISSECTOR(entry, FLOW_DISSECTOR_KEY_PORTS, tp);
-	SET_RULE_DISSECTOR(entry, FLOW_DISSECTOR_KEY_IPV4_ADDRS, ipv4);
 
 	err = tcf_ct_flow_add_match(entry, IP_CT_DIR_ORIGINAL);
 	printk(KERN_ERR "%s %d %s @@ ft: %px entry: %px, ct: %px, err: %d\n", __FILE__, __LINE__, __func__, ft, entry, entry->ct, err);
