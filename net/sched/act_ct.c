@@ -284,7 +284,7 @@ static int tcf_ct_notify_cmd_add(struct ct_flow_table *ft,
 	struct ct_flow_offload ct_flow = {};
 	struct flow_action *action;
 	struct flow_match *match;
-	int err, ok_count;
+	int err, ok_count = 0;
 
 	ct_flow.command = CT_FLOW_ADD;
 	ct_flow.block = &ft->block;
@@ -365,11 +365,11 @@ static int tcf_ct_notify_cmd_stats(struct ct_flow_table *ft,
 	tcf_ct_setup_cb_call(&ft->block, TC_SETUP_CT, &ct_flow);
 
 	printk(KERN_ERR "%s %d %s @@ ct: %px use: %d, status: %lu\n", __FILE__, __LINE__, __func__,
-		       ct, ct->ct_general.use, ct->status);
+		       ct, atomic_read(&ct->ct_general.use), ct->status);
 
 	lastused = ct_flow.stats.lastused;
 	if (lastused > entry->lastused) {
-		printk(KERN_ERR "%s %d %s @@ ft: %px entry: %px, ct: %px, new lastuse: %lu (%d secs ago)\n", __FILE__, __LINE__, __func__, ft, entry, entry->ct, lastused, jiffies_to_msecs(lastused - jiffies)/1000);
+		printk(KERN_ERR "%s %d %s @@ ft: %px entry: %px, ct: %px, new lastuse: %llu (%d secs ago)\n", __FILE__, __LINE__, __func__, ft, entry, entry->ct, lastused, jiffies_to_msecs(lastused - jiffies)/1000);
 		entry->lastused = lastused;
 
 		timeout = lastused + (HZ * 30);
