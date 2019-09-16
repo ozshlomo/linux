@@ -128,6 +128,15 @@ struct ct_flow_table_entry {
 	u64 lastused;
 };
 
+static const struct rhashtable_params zones_params = {
+	.head_offset = offsetof(struct ct_flow_table, node),
+	.key_offset = offsetof(struct ct_flow_table, zone),
+	.key_len = sizeof(((struct ct_flow_table *)0)->zone),
+	.automatic_shrinking = true,
+};
+
+static struct rhashtable zones_ht;
+
 static int tcf_ct_build_flow_action(struct flow_action *action,
 				    const struct nf_conn *ct,
 				    enum ip_conntrack_dir dir)
@@ -712,15 +721,6 @@ static int tcf_ct_notify_packet(struct ct_flow_table *ft,
 
 	return tcf_ct_notify(ft, ct, del);
 }
-
-static const struct rhashtable_params zones_params = {
-	.head_offset = offsetof(struct ct_flow_table, node),
-	.key_offset = offsetof(struct ct_flow_table, zone),
-	.key_len = sizeof(((struct ct_flow_table *)0)->zone),
-	.automatic_shrinking = true,
-};
-
-static struct rhashtable zones_ht;
 
 static int tcf_ct_create_flow_table(struct net *net, struct tcf_ct *c)
 {
