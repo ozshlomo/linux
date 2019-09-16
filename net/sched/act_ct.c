@@ -349,7 +349,6 @@ static int tcf_ct_notify_cmd_stats(struct ct_flow_table *ft,
 	struct ct_flow_offload ct_flow = {};
 	struct nf_conn *ct = entry->ct;
 	u64 lastused;
-	u32 timeout;
 
 	ct_flow.command = CT_FLOW_STATS;
 	ct_flow.block = &ft->block;
@@ -371,10 +370,6 @@ static int tcf_ct_notify_cmd_stats(struct ct_flow_table *ft,
 	if (lastused > entry->lastused) {
 		printk(KERN_ERR "%s %d %s @@ ft: %px entry: %px, ct: %px, new lastuse: %llu (%d secs ago)\n", __FILE__, __LINE__, __func__, ft, entry, entry->ct, lastused, jiffies_to_msecs(lastused - jiffies)/1000);
 		entry->lastused = lastused;
-
-		timeout = lastused + (HZ * 30);
-		if (timeout > ct->timeout)
-			ct->timeout = timeout;
 	}
 
 	return 0;

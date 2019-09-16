@@ -1305,6 +1305,10 @@ static void gc_worker(struct work_struct *work)
 			tmp = nf_ct_tuplehash_to_ctrack(h);
 
 			scanned++;
+			if (test_bit(IPS_OFFLOAD_BIT, &tmp->status)) {
+				nf_ct_offload_timeout(tmp);
+				continue;
+			}
 			if (nf_ct_zone(tmp)->id)
 				printk(KERN_ERR "%s %d %s @@ scanning: %d, i=%d, hashsz: %d, ct: %px, use: %d, status: %lu, handler: %px, calling timeout(), timeout: %d\n", __FILE__, __LINE__, __func__, scanned, i, hashsz, tmp, tmp->ct_general.use, tmp->status, tmp->offload_handler, jiffies_to_msecs(tmp->timeout - nfct_time_stamp)/1000);
 			nf_ct_offload_timeout(tmp);
