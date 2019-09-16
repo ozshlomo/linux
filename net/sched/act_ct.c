@@ -41,45 +41,6 @@ struct tc_ct_action_net {
 	bool labels;
 };
 
-static void flow_offload_fixup_tcp(struct ip_ct_tcp *tcp)
-{
-	tcp->seen[0].td_maxwin = 0;
-	tcp->seen[1].td_maxwin = 0;
-}
-
-static void flow_offload_fixup_ct_state(struct nf_conn *ct, bool start)
-{
-	const struct nf_conntrack_l4proto *l4proto;
-	unsigned int timeout;
-	int l4num;
-
-	l4num = nf_ct_protonum(ct);
-	if (l4num == IPPROTO_TCP) {
-		if (start) {
-			flow_offload_fixup_tcp(&ct->proto.tcp);
-			ct->proto.tcp.state = TCP_CONNTRACK_ESTABLISHED;
-		}
-	}
-
-	if (start)
-		return;
-
-	l4proto = nf_ct_l4proto_find(l4num);
-	if (!l4proto)
-		return;
-
-#define NF_FLOWTABLE_TCP_PICKUP_TIMEOUT	(30 * HZ)
-#define NF_FLOWTABLE_UDP_PICKUP_TIMEOUT	(30 * HZ)
-	if (l4num == IPPROTO_TCP)
-		timeout = NF_FLOWTABLE_TCP_PICKUP_TIMEOUT;
-	else if (l4num == IPPROTO_UDP)
-		timeout = NF_FLOWTABLE_UDP_PICKUP_TIMEOUT;
-	else
-		return;
-
-	ct->timeout = nfct_time_stamp + timeout;
-}
-
 static int tcf_ct_setup_cb_call(struct flow_block *block, enum tc_setup_type type,
 				void *type_data)
 {
@@ -473,7 +434,6 @@ static int tcf_ct_flow_add(struct ct_flow_table *ft, struct nf_conn *ct)
 	 * add work is queued.
 	 */
 	entry->lastused = jiffies;
-	flow_offload_fixup_ct_state(ct, true);
 
 	printk(KERN_ERR "%s %d %s @@ ft: %px entry: %px, ct: %px\n", __FILE__, __LINE__, __func__, ft, entry, ct);
 
@@ -518,8 +478,6 @@ static void tcf_ct_flow_del(struct ct_flow_table *ft,
 	/* This might put module */
 	tcf_ct_put_flow_table(ft);
 	nf_conntrack_put(&ct->ct_general);
-
-	flow_offload_fixup_ct_state(ct, false);
 }
 
 static int tcf_fill_match_tuple(struct flow_offload_tuple *key,
