@@ -285,6 +285,43 @@ static int tcf_ct_build_flow_action(struct flow_action *action,
 	return 0;
 }
 
+static int tcf_fill_match_key(struct ct_flow_table_match_key *key,
+			      const struct nf_conntrack_tuple *tuple)
+{
+	memset(key, 0, sizeof(*key));
+
+	if (tuple->src.l3num == NFPROTO_IPV4) {
+		key->control.addr_type = FLOW_DISSECTOR_KEY_IPV4_ADDRS;
+		key->basic.n_proto = htons(ETH_P_IP);
+		key->ipv4.src = tuple->src.u3.ip;
+		key->ipv4.dst = tuple->dst.u3.ip;
+	} else if (tuple->src.l3num == NFPROTO_IPV6) {
+		key->control.addr_type = FLOW_DISSECTOR_KEY_IPV6_ADDRS;
+		key->basic.n_proto = htons(ETH_P_IPV6);
+		key->ipv6.src = tuple->src.u3.in6;
+		key->ipv6.dst = tuple->dst.u3.in6;
+	} else {
+		return -EOPNOTSUPP;
+	}
+
+	switch (tuple->dst.protonum) {
+	case IPPROTO_UDP:
+		key->basic.ip_proto = IPPROTO_UDP;
+		key->tp.src = tuple->src.u.udp.port;
+		key->tp.dst = tuple->dst.u.udp.port;
+		break;
+	case IPPROTO_TCP:
+		key->basic.ip_proto = IPPROTO_TCP;
+		key->tp.src = tuple->src.u.tcp.port;
+		key->tp.dst = tuple->dst.u.tcp.port;
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}
+
+	return 0;
+};
+
 static int tcf_ct_notify_cmd_add(struct ct_flow_table *ft,
 				 const struct nf_conn *ct,
 				 struct ct_flow_table_entry *entry)
@@ -391,43 +428,6 @@ static int tcf_ct_notify_cmd_stats(struct ct_flow_table *ft,
 
 	return 0;
 }
-
-static int tcf_fill_match_key(struct ct_flow_table_match_key *key,
-			      const struct nf_conntrack_tuple *tuple)
-{
-	memset(key, 0, sizeof(*key));
-
-	if (tuple->src.l3num == NFPROTO_IPV4) {
-		key->control.addr_type = FLOW_DISSECTOR_KEY_IPV4_ADDRS;
-		key->basic.n_proto = htons(ETH_P_IP);
-		key->ipv4.src = tuple->src.u3.ip;
-		key->ipv4.dst = tuple->dst.u3.ip;
-	} else if (tuple->src.l3num == NFPROTO_IPV6) {
-		key->control.addr_type = FLOW_DISSECTOR_KEY_IPV6_ADDRS;
-		key->basic.n_proto = htons(ETH_P_IPV6);
-		key->ipv6.src = tuple->src.u3.in6;
-		key->ipv6.dst = tuple->dst.u3.in6;
-	} else {
-		return -EOPNOTSUPP;
-	}
-
-	switch (tuple->dst.protonum) {
-	case IPPROTO_UDP:
-		key->basic.ip_proto = IPPROTO_UDP;
-		key->tp.src = tuple->src.u.udp.port;
-		key->tp.dst = tuple->dst.u.udp.port;
-		break;
-	case IPPROTO_TCP:
-		key->basic.ip_proto = IPPROTO_TCP;
-		key->tp.src = tuple->src.u.tcp.port;
-		key->tp.dst = tuple->dst.u.tcp.port;
-		break;
-	default:
-		return -EOPNOTSUPP;
-	}
-
-	return 0;
-};
 
 static int tcf_ct_flow_add_match(struct ct_flow_table_entry *entry,
 				 const struct nf_conn *ct,
