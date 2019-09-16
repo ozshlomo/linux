@@ -385,7 +385,6 @@ struct flow_cls_offload {
 #define MAX_CT_FLOW_OFFLOAD_ACTS 3
 struct ct_flow_offload { /* Based on struct flow_cls_offload */
 	struct flow_block *block;
-	struct ct_flow_table *ft;
 	enum ct_flow_command command;
 	struct flow_stats stats; /* Valid for CT_FLOW_STATS command */
 	unsigned long cookie;

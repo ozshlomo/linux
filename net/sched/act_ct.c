@@ -317,7 +317,6 @@ static int tcf_ct_notify_cmd_add(struct ct_flow_table *ft,
 
 	ct_flow.command = CT_FLOW_ADD;
 	ct_flow.block = &ft->block;
-	ct_flow.ft = ft;
 
 	match = &ct_flow.rule.match;
 
@@ -380,7 +379,6 @@ static void tcf_ct_notify_cmd_del(struct ct_flow_table *ft,
 
 	ct_flow.command = CT_FLOW_DEL;
 	ct_flow.block = &ft->block;
-	ct_flow.ft = ft;
 
 	ct_flow.dir = IP_CT_DIR_ORIGINAL;
 	ct_flow.cookie = (unsigned long) &ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple;
@@ -400,7 +398,6 @@ static int tcf_ct_notify_cmd_stats(struct ct_flow_table *ft,
 
 	ct_flow.command = CT_FLOW_STATS;
 	ct_flow.block = &ft->block;
-	ct_flow.ft = ft;
 
 	ct_flow.dir = IP_CT_DIR_ORIGINAL;
 	ct_flow.cookie = (unsigned long) &ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple;
