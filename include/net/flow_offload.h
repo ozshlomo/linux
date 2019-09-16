@@ -395,7 +395,6 @@ struct ct_flow_offload { /* Based on struct flow_cls_offload */
 	struct flow_action_entry rule_action[MAX_CT_FLOW_OFFLOAD_ACTS];
 
 	/* Debug: */
-	struct nf_conn *ct;
 	enum ip_conntrack_dir dir;
 };
 

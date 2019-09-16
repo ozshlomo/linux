@@ -125,15 +125,14 @@ static const struct rhashtable_params match_params = {
 struct ct_flow_table_entry {
 	struct ct_flow_table_match match[IP_CT_DIR_MAX];
 	struct ct_flow_table *ft;
-	struct nf_conn *ct;
 	u64 lastused;
 };
 
 static int tcf_ct_build_flow_action(struct flow_action *action,
-				    struct nf_conn *ct,
+				    const struct nf_conn *ct,
 				    enum ip_conntrack_dir dir)
 {
-	struct nf_conntrack_tuple *tuple = &ct->tuplehash[dir].tuple;
+	const struct nf_conntrack_tuple *tuple = &ct->tuplehash[dir].tuple;
 	int *num_entries = &action->num_entries;
 	struct nf_conntrack_tuple target;
 	struct flow_action_entry *entry;
@@ -278,6 +277,7 @@ static int tcf_ct_build_flow_action(struct flow_action *action,
 }
 
 static int tcf_ct_notify_cmd_add(struct ct_flow_table *ft,
+				 const struct nf_conn *ct,
 				 struct ct_flow_table_entry *entry)
 {
 	struct flow_dissector dissector = {};
@@ -288,7 +288,6 @@ static int tcf_ct_notify_cmd_add(struct ct_flow_table *ft,
 
 	ct_flow.command = CT_FLOW_ADD;
 	ct_flow.block = &ft->block;
-	ct_flow.ct = entry->ct;
 	ct_flow.ft = ft;
 
 	match = &ct_flow.rule.match;
@@ -308,11 +307,11 @@ static int tcf_ct_notify_cmd_add(struct ct_flow_table *ft,
 	ct_flow.dir = IP_CT_DIR_ORIGINAL;
 	match->key = &entry->match[ct_flow.dir].key;
 	ct_flow.cookie = (unsigned long) &entry->match[ct_flow.dir];
-	err = tcf_ct_build_flow_action(action, ct_flow.ct, ct_flow.dir);
+	err = tcf_ct_build_flow_action(action, ct, ct_flow.dir);
 	if (err)
 		return err;
 	err = tcf_ct_setup_cb_call(&ft->block, TC_SETUP_CT, &ct_flow);
-	printk(KERN_ERR "%s %d %s @@ ft: %px entry: %px, ct: %px, err orig: %d\n", __FILE__, __LINE__, __func__, ft, entry, entry->ct, err);
+	printk(KERN_ERR "%s %d %s @@ ft: %px entry: %px, ct: %px, err orig: %d\n", __FILE__, __LINE__, __func__, ft, entry, ct, err);
 	if (err < 0)
 		return err;
 	ok_count += err;
@@ -320,11 +319,11 @@ static int tcf_ct_notify_cmd_add(struct ct_flow_table *ft,
 	ct_flow.dir = IP_CT_DIR_REPLY;
 	match->key = &entry->match[ct_flow.dir].key;
 	ct_flow.cookie = (unsigned long) &entry->match[ct_flow.dir];
-	err = tcf_ct_build_flow_action(action, ct_flow.ct, ct_flow.dir);
+	err = tcf_ct_build_flow_action(action, ct, ct_flow.dir);
 	if (err)
 		return ok_count;
 	err = tcf_ct_setup_cb_call(&ft->block, TC_SETUP_CT, &ct_flow);
-	printk(KERN_ERR "%s %d %s @@ ft: %px entry: %px, ct: %px, err reply: %d\n", __FILE__, __LINE__, __func__, ft, entry, entry->ct, err);
+	printk(KERN_ERR "%s %d %s @@ ft: %px entry: %px, ct: %px, err reply: %d\n", __FILE__, __LINE__, __func__, ft, entry, ct, err);
 	if (err < 0)
 		return ok_count;
 	ok_count += err;
@@ -333,15 +332,15 @@ static int tcf_ct_notify_cmd_add(struct ct_flow_table *ft,
 }
 
 static void tcf_ct_notify_cmd_del(struct ct_flow_table *ft,
+				  const struct nf_conn *ct,
 				  struct ct_flow_table_entry *entry)
 {
 	struct ct_flow_offload ct_flow = {};
 
-	printk(KERN_ERR "%s %d %s @@ ft: %px entry: %px, ct: %px\n", __FILE__, __LINE__, __func__, ft, entry, entry->ct);
+	printk(KERN_ERR "%s %d %s @@ ft: %px entry: %px, ct: %px\n", __FILE__, __LINE__, __func__, ft, entry, ct);
 
 	ct_flow.command = CT_FLOW_DEL;
 	ct_flow.block = &ft->block;
-	ct_flow.ct = entry->ct;
 	ct_flow.ft = ft;
 
 	ct_flow.dir = IP_CT_DIR_ORIGINAL;
@@ -354,15 +353,14 @@ static void tcf_ct_notify_cmd_del(struct ct_flow_table *ft,
 }
 
 static int tcf_ct_notify_cmd_stats(struct ct_flow_table *ft,
+				   const struct nf_conn *ct,
 				   struct ct_flow_table_entry *entry)
 {
 	struct ct_flow_offload ct_flow = {};
-	struct nf_conn *ct = entry->ct;
 	u64 lastused;
 
 	ct_flow.command = CT_FLOW_STATS;
 	ct_flow.block = &ft->block;
-	ct_flow.ct = entry->ct;
 	ct_flow.ft = ft;
 
 	ct_flow.dir = IP_CT_DIR_ORIGINAL;
@@ -374,11 +372,11 @@ static int tcf_ct_notify_cmd_stats(struct ct_flow_table *ft,
 	tcf_ct_setup_cb_call(&ft->block, TC_SETUP_CT, &ct_flow);
 
 	printk(KERN_ERR "%s %d %s @@ ct: %px use: %d, status: %lu\n", __FILE__, __LINE__, __func__,
-		       ct, atomic_read(&ct->ct_general.use), ct->status);
+			ct, atomic_read(&ct->ct_general.use), ct->status);
 
 	lastused = ct_flow.stats.lastused;
 	if (lastused > entry->lastused) {
-		printk(KERN_ERR "%s %d %s @@ ft: %px entry: %px, ct: %px, new lastuse: %llu (%d secs ago)\n", __FILE__, __LINE__, __func__, ft, entry, entry->ct, lastused, jiffies_to_msecs(lastused - jiffies)/1000);
+		printk(KERN_ERR "%s %d %s @@ ft: %px entry: %px, ct: %px, new lastuse: %llu (%d secs ago)\n", __FILE__, __LINE__, __func__, ft, entry, ct, lastused, jiffies_to_msecs(lastused - jiffies)/1000);
 		entry->lastused = lastused;
 	}
 
@@ -386,7 +384,7 @@ static int tcf_ct_notify_cmd_stats(struct ct_flow_table *ft,
 }
 
 static int tcf_fill_match_key(struct ct_flow_table_match_key *key,
-			      struct nf_conntrack_tuple *tuple)
+			      const struct nf_conntrack_tuple *tuple)
 {
 	memset(key, 0, sizeof(*key));
 
@@ -423,9 +421,10 @@ static int tcf_fill_match_key(struct ct_flow_table_match_key *key,
 };
 
 static int tcf_ct_flow_add_match(struct ct_flow_table_entry *entry,
+				 const struct nf_conn *ct,
 				 enum ip_conntrack_dir dir)
 {
-	struct nf_conntrack_tuple *tuple = &entry->ct->tuplehash[dir].tuple;
+	const struct nf_conntrack_tuple *tuple = &ct->tuplehash[dir].tuple;
 	struct ct_flow_table_match_key *key = &entry->match[dir].key;
 	struct ct_flow_table_match *match = &entry->match[dir];
 	struct ct_flow_table *ft = entry->ft;
@@ -452,7 +451,8 @@ static void tcf_ct_flow_remove_match(struct ct_flow_table_entry *entry,
 	rhashtable_remove_fast(&ft->table, &match->node, match_params);
 }
 
-static void tcf_ct_flow_del(struct ct_flow_table_entry *entry);
+static void tcf_ct_flow_del(struct ct_flow_table_entry *entry,
+			    struct nf_conn *ct);
 static int tcf_ct_notify(struct ct_flow_table *ft,
 			 struct nf_conn *ct,
 			 bool del);
@@ -466,11 +466,11 @@ static int tcf_ct_offload_handler(struct nf_conn *ct,
 	switch (offload_event) {
 		case OFFLOAD_STATS:
 			printk(KERN_ERR "%s %d %s @@ STATS: ft: %px, entry: %px ct: %px\n", __FILE__, __LINE__, __func__, ft, entry, ct);
-			tcf_ct_notify_cmd_stats(ft, entry);
+			tcf_ct_notify_cmd_stats(ft, ct, entry);
 			return 0;
 		case OFFLOAD_DEL:
 			printk(KERN_ERR "%s %d %s @@ DEL: ft: %px, entry: %px ct: %px\n", __FILE__, __LINE__, __func__, ft, entry, ct);
-			tcf_ct_notify(ft, entry->ct, true);
+			tcf_ct_notify(ft, ct, true);
 			return 0;
 		default:
 			return -EOPNOTSUPP;
@@ -493,32 +493,31 @@ static int tcf_ct_flow_add(struct ct_flow_table *ft, struct nf_conn *ct)
 	 * add work is queued.
 	 */
 	entry->ft = ft;
-	entry->ct = ct;
 	entry->lastused = jiffies;
 	flow_offload_fixup_ct_state(ct, true);
 
-	printk(KERN_ERR "%s %d %s @@ ft: %px entry: %px, ct: %px\n", __FILE__, __LINE__, __func__, ft, entry, entry->ct);
+	printk(KERN_ERR "%s %d %s @@ ft: %px entry: %px, ct: %px\n", __FILE__, __LINE__, __func__, ft, entry, ct);
 
-	err = tcf_ct_flow_add_match(entry, IP_CT_DIR_ORIGINAL);
-	printk(KERN_ERR "%s %d %s @@ ft: %px entry: %px, ct: %px, err: %d\n", __FILE__, __LINE__, __func__, ft, entry, entry->ct, err);
+	err = tcf_ct_flow_add_match(entry, ct, IP_CT_DIR_ORIGINAL);
+	printk(KERN_ERR "%s %d %s @@ ft: %px entry: %px, ct: %px, err: %d\n", __FILE__, __LINE__, __func__, ft, entry, ct, err);
 	if (err)
 		goto err_match;
-	err = tcf_ct_flow_add_match(entry, IP_CT_DIR_REPLY);
-	printk(KERN_ERR "%s %d %s @@ ft: %px entry: %px, ct: %px, err: %d\n", __FILE__, __LINE__, __func__, ft, entry, entry->ct, err);
+	err = tcf_ct_flow_add_match(entry, ct, IP_CT_DIR_REPLY);
+	printk(KERN_ERR "%s %d %s @@ ft: %px entry: %px, ct: %px, err: %d\n", __FILE__, __LINE__, __func__, ft, entry, ct, err);
 	if (err)
 		goto err_match_reply;
 
-	err = tcf_ct_notify_cmd_add(entry->ft, entry);
-	printk(KERN_ERR "%s %d %s @@ ft: %px entry: %px, ct: %px, err: %d\n", __FILE__, __LINE__, __func__, ft, entry, entry->ct, err);
+	err = tcf_ct_notify_cmd_add(entry->ft, ct, entry);
+	printk(KERN_ERR "%s %d %s @@ ft: %px entry: %px, ct: %px, err: %d\n", __FILE__, __LINE__, __func__, ft, entry, ct, err);
 	if (err < 0)
 		goto err_notify;
 
-	nf_conntrack_get(&entry->ct->ct_general);
+	nf_conntrack_get(&ct->ct_general);
 	ct->offload_priv = entry;
 	rcu_assign_pointer(ct->offload_handler, tcf_ct_offload_handler);
 	entry->ft->ref++;
 
-	printk(KERN_ERR "%s %d %s @@ ft: %px entry: %px, ct: %px, err: %d\n", __FILE__, __LINE__, __func__, ft, entry, entry->ct, 0);
+	printk(KERN_ERR "%s %d %s @@ ft: %px entry: %px, ct: %px, err: %d\n", __FILE__, __LINE__, __func__, ft, entry, ct, 0);
 	return 0;
 
 err_notify:
@@ -530,10 +529,10 @@ err_match:
 }
 
 static void tcf_ct_put_flow_table(struct ct_flow_table *ft);
-static void tcf_ct_flow_del(struct ct_flow_table_entry *entry)
+static void tcf_ct_flow_del(struct ct_flow_table_entry *entry,
+			    struct nf_conn *ct)
 {
 	struct ct_flow_table *ft = entry->ft;
-	struct nf_conn *ct = entry->ct;
 
 	printk(KERN_ERR "%s %d %s @@ DEL: ft: %px, entry: %px ct: %px\n", __FILE__, __LINE__, __func__, ft, entry, ct);
 
@@ -541,7 +540,7 @@ static void tcf_ct_flow_del(struct ct_flow_table_entry *entry)
 	RCU_INIT_POINTER(ct->offload_handler, NULL);
 	clear_bit(IPS_OFFLOAD_BIT, &ct->status);
 
-	tcf_ct_notify_cmd_del(ft, entry);
+	tcf_ct_notify_cmd_del(ft, ct, entry);
 
 	tcf_ct_flow_remove_match(entry, IP_CT_DIR_REPLY);
 	tcf_ct_flow_remove_match(entry, IP_CT_DIR_ORIGINAL);
@@ -587,7 +586,7 @@ static void tcf_ct_flow_del_by_ct(struct ct_flow_table *ft, struct nf_conn *ct)
 
 	entry = container_of(match, struct ct_flow_table_entry,
 			     match[match->dir]);
-	tcf_ct_flow_del(entry);
+	tcf_ct_flow_del(entry, ct);
 }
 
 struct act_ct_work {
