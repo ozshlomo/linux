@@ -7,6 +7,7 @@
 
 #if IS_ENABLED(CONFIG_NF_CONNTRACK)
 #include <net/netfilter/nf_nat.h>
+#include <net/netfilter/nf_flow_table.h>
 #include <net/netfilter/nf_conntrack_labels.h>
 
 struct tcf_ct_params {
@@ -31,7 +32,7 @@ struct ct_flow_table {
 	struct rhash_head node; /* In zones tables */
 
 	struct rcu_work rwork;
-	struct rhashtable table;
+	struct nf_flowtable table;
 	struct flow_block block;
 	u16 zone;
 	u32 ref;
